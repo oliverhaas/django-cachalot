@@ -297,8 +297,9 @@ def _get_tables(db_alias, query, compiler=False):
 def _get_table_cache_keys(compiler):
     db_alias = compiler.using
     get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
-    return [get_table_cache_key(db_alias, t)
-            for t in _get_tables(db_alias, compiler.query, compiler)]
+    tables = _get_tables(db_alias, compiler.query, compiler)
+    table_cache_keys = [get_table_cache_key(db_alias, t) for t in tables]
+    return tables, table_cache_keys
 
 
 def _invalidate_tables(cache, db_alias, tables):
