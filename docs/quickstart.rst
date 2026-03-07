@@ -274,8 +274,8 @@ Settings
     this table. If all tables in a query map to the same alias, that cache
     is used; otherwise the query falls back to ``CACHALOT_CACHE``.
   - ``timeout``: Cache timeout in seconds for queries involving this table.
-    When a query involves multiple tables, the minimum timeout is used.
-    Tables without a timeout override use ``CACHALOT_TIMEOUT``.
+    If all tables in a query have a timeout override, the minimum is used;
+    otherwise the query falls back to ``CACHALOT_TIMEOUT``.
 
   Example::
 

@@ -336,15 +336,22 @@ def get_cache_aliases_for_invalidation(tables):
 
 def get_timeout_for_tables(tables):
     """Returns the cache timeout for a query involving the given tables.
-    Uses the minimum timeout across all involved tables."""
+    Uses the per-table timeout only if ALL tables have a timeout override,
+    otherwise falls back to CACHALOT_TIMEOUT."""
     overrides = cachalot_settings.CACHALOT_TABLE_OVERRIDES
     default_timeout = cachalot_settings.CACHALOT_TIMEOUT
     if not overrides:
         return default_timeout
-    timeouts = [overrides.get(t, {}).get('timeout', default_timeout)
-                for t in tables]
-    finite = [t for t in timeouts if t is not None]
-    return min(finite) if finite else default_timeout
+    timeout = None
+    for table in tables:
+        table_timeout = overrides.get(table, {}).get('timeout')
+        if table_timeout is None:
+            return default_timeout
+        if timeout is None:
+            timeout = table_timeout
+        else:
+            timeout = min(timeout, table_timeout)
+    return timeout if timeout is not None else default_timeout
 
 
 def _invalidate_tables(cache, db_alias, tables):
