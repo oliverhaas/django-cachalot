@@ -94,27 +94,47 @@ def parse_tenant_statement(sql, params=None):
 
     set_re, reset_re, set_config_re = _compile(guc)
 
-    match = set_config_re.search(sql)
-    if match is not None:
+    # Collect all matches that touch the configured GUC.
+    # Fail closed if more than one construct touches it (ambiguous end state).
+    matches = []
+
+    # Check set_config matches
+    for match in set_config_re.finditer(sql):
         name = _resolve(match.group('name'), sql, match.start('name'), params)
+        if name is UNKNOWN or name == guc:
+            matches.append(('set_config', match, name))
+
+    # Check SET matches (all of them, including non-LOCAL)
+    for match in set_re.finditer(sql):
+        matches.append(('set', match, None))
+
+    # Check RESET matches
+    for match in reset_re.finditer(sql):
+        matches.append(('reset', match, None))
+
+    # If more than one construct touches the GUC, we cannot determine the
+    # final state confidently, so fail closed to UNKNOWN.
+    if len(matches) > 1:
+        return UNKNOWN
+    elif len(matches) == 0:
+        return NOT_A_SET
+
+    # Exactly one match: process it.
+    match_type, match, name = matches[0]
+
+    if match_type == 'set_config':
         if name is UNKNOWN:
             return UNKNOWN
-        if name != guc:
-            return NOT_A_SET
         if match.group('local').lower() not in ('true', 't', "'t'", "'true'"):
             return UNKNOWN
         return _resolve(match.group('value'), sql, match.start('value'), params)
-
-    match = set_re.search(sql)
-    if match is not None:
+    elif match_type == 'set':
+        # Check locality: non-LOCAL SET is unsafe and fails closed.
         if (match.group('scope') or '').upper() != 'LOCAL':
             return UNKNOWN
         return _resolve(match.group('value'), sql, match.start('value'), params)
-
-    if reset_re.search(sql) is not None:
+    else:  # reset
         return None
-
-    return NOT_A_SET
 
 
 def _iter_params(params):

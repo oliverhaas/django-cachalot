@@ -101,3 +101,31 @@ class ParseTenantStatementTestCase(SimpleTestCase):
         with override_settings(CACHALOT_TENANT_SETTING=None):
             self.assertIs(self.parse("SET LOCAL app.tenant_id = '42'"),
                           NOT_A_SET)
+
+    def test_multiple_constructs_fail_closed(self):
+        # Two SET LOCAL statements for the GUC.
+        self.assertIs(
+            self.parse("SET LOCAL app.tenant_id = '1'; SET LOCAL app.tenant_id = '2'"),
+            UNKNOWN)
+        # SET LOCAL followed by RESET of the GUC.
+        self.assertIs(
+            self.parse("SET LOCAL app.tenant_id = '42'; RESET app.tenant_id"),
+            UNKNOWN)
+
+    def test_unrelated_trailing_statement_ignored(self):
+        # One SET LOCAL for the GUC plus an unrelated statement.
+        # The guard does not fire; we return the value.
+        self.assertEqual(self.parse("SET LOCAL app.tenant_id = '7'; SELECT 1"),
+                         '7')
+
+
+class TenancyEnabledTestCase(SimpleTestCase):
+    def test_enabled_when_setting_is_none(self):
+        from ..tenancy import tenancy_enabled
+        with override_settings(CACHALOT_TENANT_SETTING=None):
+            self.assertFalse(tenancy_enabled())
+
+    def test_enabled_when_setting_is_configured(self):
+        from ..tenancy import tenancy_enabled
+        with override_settings(CACHALOT_TENANT_SETTING='app.tenant_id'):
+            self.assertTrue(tenancy_enabled())
