@@ -221,4 +221,9 @@ def are_all_shared(tables):
         # which is what keeps callers that forget to check behave like master.
         return True
     shared = cachalot_settings.CACHALOT_TENANT_SHARED_TABLES
-    return bool(tables) and set(tables).issubset(shared)
+    # A table listed as both partitioned and shared is a contradiction, and
+    # the two halves would disagree: the query key would not carry the tenant
+    # while the invalidation keys still would, so one tenant's rows could be
+    # served to another. Partitioned wins, which is the safe side.
+    return bool(tables) and all(table in shared and not is_partitioned(table)
+                                for table in tables)

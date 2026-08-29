@@ -246,6 +246,12 @@ class TablePredicatesTestCase(SimpleTestCase):
                                          'cachalot_test'}))
         self.assertFalse(are_all_shared(set()))
 
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=('cachalot_testparent',),
+                       CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
+    def test_partitioned_beats_shared(self):
+        self.assertFalse(are_all_shared({'cachalot_testparent'}))
+
     @override_settings(CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
     def test_are_all_shared_when_feature_disabled(self):
         # With the feature off, are_all_shared should return True to behave
@@ -639,12 +645,24 @@ class PartitionedReadTestCase(TestUtilsMixin, FilteredTransactionTestCase):
             self.read('a')
 
     def test_unknown_tenant_is_never_cached(self):
+        # Assert on the cache directly, not just on the query count: a 1/1
+        # sequence also passes with caching switched off entirely, so it does
+        # not by itself prove the read stored anything. Snapshot the table
+        # cache keys this table could plausibly be stored under (unscoped or
+        # under tenant 'a') before and after, since the cache is shared with
+        # other tests and may already hold unrelated entries for this table.
+        cache = cachalot_caches.get_cache(db_alias=DEFAULT_DB_ALIAS)
+        keys = (get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, None)
+               + get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, 'a'))
+        before = cache.get_many(keys)
         with transaction.atomic():
             observe_statement(connection, "SET app.tenant_id = 'a'")
             with self.assertNumQueries(1):
                 list(Test.objects.all())
             with self.assertNumQueries(1):
                 list(Test.objects.all())
+        after = cache.get_many(keys)
+        self.assertEqual(after, before)
 
 
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
@@ -665,6 +683,11 @@ class SharedTableTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         with as_tenant('a'):
             with self.assertNumQueries(1):
                 list(User.objects.all())
+        with as_tenant('b'):
+            # Distinct tenant, so this must not be served from tenant a's
+            # cache entry even though the table itself is not partitioned.
+            with self.assertNumQueries(1):
+                list(User.objects.all())
         with as_tenant('a'):
             with self.assertNumQueries(0):
                 list(User.objects.all())
@@ -673,3 +696,37 @@ class SharedTableTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         with as_tenant('a'):
             with self.assertNumQueries(1):
                 list(User.objects.all())
+
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=('cachalot_testparent',),
+                       CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
+    def test_partitioned_and_shared_table_does_not_leak_across_tenants(self):
+        # A table listed as both partitioned and shared used to leak: the
+        # query key stayed unscoped (are_all_shared wrongly said True) while
+        # the invalidation keys stayed per-tenant, so tenant b's write only
+        # bumped its own tenant key, and b's re-stored rows -- freshly
+        # written under that same unscoped query key when b's own read
+        # missed -- were then served straight back to tenant a on a's next,
+        # otherwise valid, cache hit.
+        #
+        # With the fix, a's and b's reads land on distinct, tenant-folded
+        # query keys, so there is no shared slot left for b's rows to leak
+        # through. Tenant a's own key is never touched by b's write (that is
+        # the point of partitioning: one tenant's write must not invalidate
+        # another tenant's cache), so a's final read is legitimately a cache
+        # hit (0 queries) too -- what must not happen is that hit returning
+        # b's row, which is what the assertions below pin down.
+        with as_tenant('a'):
+            with self.assertNumQueries(1):
+                rows_a_before = list(TestParent.objects.all())
+        with as_tenant('b'):
+            TestParent.objects.create(name='from_b')
+        with as_tenant('b'):
+            with self.assertNumQueries(1):
+                rows_b = list(TestParent.objects.all())
+        with as_tenant('a'):
+            with self.assertNumQueries(0):
+                rows_a_after = list(TestParent.objects.all())
+        self.assertEqual([row.name for row in rows_a_before], [])
+        self.assertEqual([row.name for row in rows_b], ['from_b'])
+        self.assertEqual([row.name for row in rows_a_after], [])
