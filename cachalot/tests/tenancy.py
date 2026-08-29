@@ -14,7 +14,7 @@ from ..tenancy import (
     observe_statement, parse_tenant_statement, pop_tenant, push_tenant,
 )
 from ..utils import (
-    get_read_table_cache_keys, get_table_cache_key,
+    TENANT_TABLE_SUFFIX, get_read_table_cache_keys, get_table_cache_key,
     get_tenant_query_cache_key, get_write_table_cache_keys,
 )
 from .models import Test
@@ -314,6 +314,16 @@ class TableCacheKeysTestCase(SimpleTestCase):
         self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, 42),
                          get_write_table_cache_keys(DB, PARTITIONED, '42'))
 
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
+    def test_unknown_tenant_normalised_to_none_in_key_functions(self):
+        # UNKNOWN must fold to the same single legacy key as an unscoped
+        # (None) tenant, not derive a key from the sentinel's repr.
+        self.assertEqual(get_read_table_cache_keys(DB, PARTITIONED, UNKNOWN),
+                         get_read_table_cache_keys(DB, PARTITIONED, None))
+        self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, UNKNOWN),
+                         get_write_table_cache_keys(DB, PARTITIONED, None))
+
     def test_tenant_query_cache_key(self):
         base = 'a' * 40
         self.assertNotEqual(get_tenant_query_cache_key(base, '42'), base)
@@ -516,9 +526,11 @@ class TenantInvalidationTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         self.assertGreater(self.last('a'), 0.0)
         self.assertGreater(self.last('b'), 0.0)
 
-        # No pseudo-tenant key was minted for the sentinel's repr.
-        bogus_key = get_write_table_cache_keys(
-            DEFAULT_DB_ALIAS, PARTITIONED, UNKNOWN)[1]
+        # No pseudo-tenant key was minted for the sentinel's repr. Built by
+        # hand, bypassing get_write_table_cache_keys, since that function now
+        # normalises UNKNOWN itself and can no longer produce this key.
+        bogus_key = cachalot_settings.CACHALOT_TABLE_KEYGEN(
+            DEFAULT_DB_ALIAS, PARTITIONED + TENANT_TABLE_SUFFIX + str(UNKNOWN))
         cache = cachalot_caches.get_cache(db_alias=DEFAULT_DB_ALIAS)
         self.assertEqual(cache.get_many([bogus_key]), {})
 
@@ -558,3 +570,11 @@ class TenantInvalidationTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         partitioned_tenants = sorted(
             tenant for sender, tenant in received if sender == PARTITIONED)
         self.assertEqual(partitioned_tenants, ['a', 'b'])
+
+    def test_get_last_invalidation_with_unknown_tenant_sees_scoped_write(self):
+        with as_tenant('a'):
+            Test.objects.create(name='x')
+        expected = self.last(None)
+        self.assertGreater(expected, 0.0)
+        self.assertEqual(get_last_invalidation(PARTITIONED, tenant=UNKNOWN),
+                         expected)
