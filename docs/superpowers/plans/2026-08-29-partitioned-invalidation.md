@@ -610,13 +610,22 @@ def observe_statement(connection, sql, params=None, failed=False):
 
 
 def push_tenant(connection):
-    """Remember the current tenant on entering an atomic block."""
+    """
+    Remember the current tenant on entering an atomic block.
+
+    The outermost block also clears the live value.  A matching ``pop_tenant``
+    normally does that already, but the clear here means a dropped or skipped
+    pop cannot carry one transaction's tenant into the next on a pooled
+    connection.  Nested blocks leave it alone so they inherit the outer tenant.
+    """
     if not tenancy_enabled():
         return
     stack = getattr(connection, '_cachalot_tenant_stack', None)
     if stack is None:
         stack = connection._cachalot_tenant_stack = []
     stack.append(getattr(connection, '_cachalot_tenant', None))
+    if len(stack) == 1:
+        connection._cachalot_tenant = None
 
 
 def pop_tenant(connection):
@@ -626,8 +635,8 @@ def pop_tenant(connection):
     On the outermost block this restores ``None``, which is what ending the
     transaction does to a ``SET LOCAL``. On a committed *nested* block this is
     deliberately conservative: PostgreSQL would keep a ``SET LOCAL`` issued
-    inside a released savepoint, we revert it and fall back to unscoped
-    invalidation.
+    inside a released savepoint, we revert it to the tenant that was in force
+    when the nested block was entered.
     """
     if not tenancy_enabled():
         return
@@ -641,6 +650,10 @@ def is_partitioned(table):
 
 
 def are_all_shared(tables):
+    if not tenancy_enabled():
+        # With the feature off every table is effectively tenant-agnostic,
+        # which is what keeps callers that forget to check behave like master.
+        return True
     shared = cachalot_settings.CACHALOT_TENANT_SHARED_TABLES
     return bool(tables) and set(tables).issubset(shared)
 ```
