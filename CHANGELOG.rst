@@ -1,5 +1,11 @@
 What’s new in django-cachalot?
 ==============================
+Unreleased
+----------
+- Add per-tenant cache partitioning and invalidation for PostgreSQL
+  Row-Level Security deployments (``CACHALOT_TENANT_SETTING``,
+  ``CACHALOT_PARTITIONED_TABLES``, ``CACHALOT_TENANT_SHARED_TABLES``)
+
 2.9.1
 -----
 - Add support for Django 6.1
