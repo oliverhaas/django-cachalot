@@ -375,9 +375,8 @@ def _invalidate_tables(cache, db_alias, tables, tenant=None):
         cachalot_settings.CACHALOT_TIMEOUT)
 
     if isinstance(cache, AtomicCache):
-        # A non-partitioned table ignores the tenant when its keys are built,
-        # so buffering one would emit a redundant `post_invalidation` signal
-        # per tenant for a table master signals once.
+        # Buffering a tenant for a non-partitioned table would signal once
+        # per tenant where master signals once.
         cache.to_be_invalidated.update(
             (table, tenant if is_partitioned(table) else None)
             for table in tables)
