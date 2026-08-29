@@ -1,4 +1,4 @@
-from unittest import skipUnless
+from unittest import mock, skipUnless
 
 from django.db import DEFAULT_DB_ALIAS, connection, transaction
 from django.test import TransactionTestCase, override_settings, SimpleTestCase
@@ -404,16 +404,36 @@ class TenantPlumbingTestCase(TransactionTestCase):
         # by the time the block exited, leaving the stack permanently one
         # deeper and letting a stale tenant survive into later transactions.
         override = override_settings(CACHALOT_TENANT_SETTING=None)
-        with transaction.atomic():
-            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
-            self.assertEqual(get_tenant(connection), '42')
-            override.enable()
-            # The feature is off from here on, including when this
-            # `transaction.atomic()` block's `__exit__` runs below - exactly
-            # the case `pop_tenant` must still handle correctly.
-            self.assertIsNone(get_tenant(connection))
-        override.disable()
+        try:
+            with transaction.atomic():
+                observe_statement(
+                    connection, "SET LOCAL app.tenant_id = '42'")
+                self.assertEqual(get_tenant(connection), '42')
+                override.enable()
+                # The feature is off from here on, including when this
+                # `transaction.atomic()` block's `__exit__` runs below -
+                # exactly the case `pop_tenant` must still handle correctly.
+                self.assertIsNone(get_tenant(connection))
+        finally:
+            # Not `addCleanup`: the assertions below need the feature back on.
+            # Without the `finally` a failed assertion above would skip this
+            # and leak the override into every later test in the process.
+            override.disable()
         stack = getattr(connection, '_cachalot_tenant_stack', None)
         self.assertFalse(stack, 'tenant stack leaked: %r' % (stack,))
         with transaction.atomic():
             self.assertIsNone(get_tenant(connection))
+
+    def test_interrupted_statement_lands_on_unknown(self):
+        # `except BaseException`, not `except Exception`: a statement killed
+        # by KeyboardInterrupt or SystemExit did not take effect either, so
+        # its tenant must not be trusted.  A plain OperationalError would
+        # pass against the old `except Exception` too, so this is the only
+        # test that pins the wider clause down.
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                with mock.patch.object(cursor.cursor, 'execute',
+                                       side_effect=KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        cursor.execute("SET LOCAL app.tenant_id = '42'")
+            self.assertIs(get_tenant(connection), UNKNOWN)
