@@ -181,6 +181,12 @@ class ParseTenantStatementTestCase(SimpleTestCase):
                        'SET LOCAL app.tenant_id = %s', ['msg', '9']),
             '9')
 
+    def test_psycopg3_placeholders_shift_the_index_too(self):
+        self.assertEqual(
+            self.parse('INSERT INTO log (blob) VALUES (%b); '
+                       'SET LOCAL app.tenant_id = %s', ['blob', '9']),
+            '9')
+
     def test_escaped_percent_is_not_a_placeholder(self):
         self.assertEqual(
             self.parse("INSERT INTO log (msg) VALUES ('%%s'); "

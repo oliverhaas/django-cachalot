@@ -468,7 +468,8 @@ def _resolve(token, sql, pos, params):
         if params is None:
             return UNKNOWN
         # psycopg counts a `%s` inside a literal as a placeholder too, but
-        # `%%s` is an escaped percent sign rather than one.
+        # `%%s` is an escaped percent sign rather than one.  psycopg3 also
+        # spells a placeholder `%b` or `%t`.
         index = i = 0
         while i < pos:
             if sql[i] != '%':
@@ -476,7 +477,7 @@ def _resolve(token, sql, pos, params):
             elif sql.startswith('%%', i):
                 i += 2
             else:
-                index += sql.startswith('%s', i)
+                index += sql[i + 1:i + 2] in ('s', 'b', 't')
                 i += 1
         try:
             value = params[index]
@@ -832,10 +833,8 @@ def are_all_shared(tables):
         # which is what keeps callers that forget to check behave like master.
         return True
     shared = cachalot_settings.CACHALOT_TENANT_SHARED_TABLES
-    # A table listed as both partitioned and shared is a contradiction, and
-    # the two halves would disagree: the query key would not carry the tenant
-    # while the invalidation keys still would, so one tenant's rows could be
-    # served to another. Partitioned wins, which is the safe side.
+    # Listed as both, partitioned wins: an unscoped query key over per-tenant
+    # invalidation keys would serve one tenant's rows to another.
     return bool(tables) and all(table in shared and not is_partitioned(table)
                                 for table in tables)
 ```
