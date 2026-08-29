@@ -39,7 +39,7 @@ DJANGO_SETTINGS_MODULE=test_settings_sqlite python -m django test cachalot.tests
 
 The default `settings` module declares PostgreSQL, MySQL, Redis and Memcached and requires all four to be running; `runtests.py` uses it. Use it only when those servers are up.
 
-Known-failing on SQLite before any of this work starts, do not chase them: `SettingsTestCase.test_cache`, the jinja2/template cases, and the multi-database cases.
+**The baseline is green: 198 tests, 0 failures, 23 skipped.** It was verified on this branch before Task 1. Any failure you see is yours — do not attribute it to a pre-existing problem.
 
 ## File Structure
 
@@ -83,12 +83,22 @@ servers. This trims them to SQLite and locmem.
 """
 from settings import *  # noqa: F401,F403
 
-DATABASES = {'default': {
-    'ENGINE': 'django.db.backends.sqlite3',
-    'NAME': 'cachalot.sqlite3',
-    'TEST': {'NAME': 'test_cachalot.sqlite3'},
-}}
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': 'cachalot.sqlite3',
+        'TEST': {'NAME': 'test_cachalot.sqlite3'},
+    },
+    # A second alias is required: several existing tests (CommandTestCase,
+    # MultiDatabaseTestCase) look for a database other than 'default'.
+    'secondary': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': 'cachalot2.sqlite3',
+        'TEST': {'NAME': 'test_cachalot2.sqlite3'},
+    },
+}
 DATABASE_ROUTERS = []
+# Two cache aliases, so SettingsTestCase.test_cache is not skipped.
 CACHES = {
     'default': CACHES['default'],  # noqa: F405
     'locmem2': {
@@ -102,7 +112,7 @@ CACHES = {
 - [ ] **Step 2: Verify the harness runs an existing test module**
 
 Run: `source .venv/bin/activate && DJANGO_SETTINGS_MODULE=test_settings_sqlite python -m django test cachalot.tests.signals --noinput -v1`
-Expected: `OK` (4 tests, some skipped).
+Expected: `OK`. Then run the whole suite — `DJANGO_SETTINGS_MODULE=test_settings_sqlite python -m django test cachalot.tests --noinput -v1` — and confirm `OK (skipped=23)` over 198 tests.
 
 - [ ] **Step 3: Write the failing settings test**
 
@@ -1004,7 +1014,7 @@ Expected: PASS — every test in `cachalot.tests.tenancy`, with the PostgreSQL-o
 - [ ] **Step 5: Run the full suite for regressions**
 
 Run: `DJANGO_SETTINGS_MODULE=test_settings_sqlite python -m django test cachalot.tests --noinput -v1`
-Expected: same failures as before this task and no others — `SettingsTestCase.test_cache`, jinja2/template cases, multi-database cases.
+Expected: `OK`, 0 failures.
 
 - [ ] **Step 6: Commit**
 
@@ -1271,7 +1281,7 @@ Expected: PASS — every test in `cachalot.tests.tenancy`, with the PostgreSQL-o
 - [ ] **Step 9: Run the full suite for regressions**
 
 Run: `DJANGO_SETTINGS_MODULE=test_settings_sqlite python -m django test cachalot.tests --noinput -v1`
-Expected: only the pre-existing failures listed in "Test commands". `SignalsTestCase` must still pass — its receivers take `**kwargs`, so the new `tenant` kwarg is harmless.
+Expected: `OK`, 0 failures. `SignalsTestCase` must still pass — its receivers take `**kwargs`, so the new `tenant` kwarg is harmless.
 
 - [ ] **Step 10: Commit**
 
@@ -1474,7 +1484,7 @@ Expected: PASS — every test in `cachalot.tests.tenancy`, with the PostgreSQL-o
 - [ ] **Step 6: Run the full suite for regressions**
 
 Run: `DJANGO_SETTINGS_MODULE=test_settings_sqlite python -m django test cachalot.tests --noinput -v1`
-Expected: only the pre-existing failures listed in "Test commands".
+Expected: `OK`, 0 failures.
 
 - [ ] **Step 7: Commit**
 
@@ -1746,7 +1756,7 @@ Expected: no warnings about `tenancy.rst` or undefined references. If Sphinx is 
 - [ ] **Step 6: Run the full suite one last time**
 
 Run: `DJANGO_SETTINGS_MODULE=test_settings_sqlite python -m django test cachalot.tests --noinput -v1`
-Expected: only the pre-existing failures listed in "Test commands".
+Expected: `OK`, 0 failures.
 
 - [ ] **Step 7: Commit**
 
