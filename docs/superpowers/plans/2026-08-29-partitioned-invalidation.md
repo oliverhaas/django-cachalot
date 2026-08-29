@@ -517,9 +517,8 @@ def _parse_tenant_statement(sql, params=None):
         return NOT_A_SET, 'none'
     lowered = sql.lower()
     if guc.lower() not in lowered:
-        # The GUC name must appear literally, except when it arrives as a
-        # set_config() parameter.  Scanning the parameters is worth it only
-        # for that form, and `params` can be very long.
+        # Only set_config() can carry the name as a parameter, and `params`
+        # can be very long, so the scan is gated on that form.
         values = params.values() if isinstance(params, dict) else params
         if 'set_config' not in lowered or guc not in (values or ()):
             return NOT_A_SET, 'none'
