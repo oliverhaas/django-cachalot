@@ -1,10 +1,14 @@
-from django.db import connection, transaction
+from django.db import DEFAULT_DB_ALIAS, connection, transaction
 from django.test import TransactionTestCase, override_settings, SimpleTestCase
 
 from ..settings import cachalot_settings
 from ..tenancy import (
     NOT_A_SET, UNKNOWN, are_all_shared, get_tenant, is_partitioned,
     observe_statement, parse_tenant_statement, pop_tenant, push_tenant,
+)
+from ..utils import (
+    get_read_table_cache_keys, get_table_cache_key,
+    get_tenant_query_cache_key, get_write_table_cache_keys,
 )
 
 
@@ -239,3 +243,77 @@ class TablePredicatesTestCase(SimpleTestCase):
         # like master (no tenant scoping), even if the table is not in the
         # shared tables list.
         self.assertTrue(are_all_shared({'cachalot_test'}))
+
+
+DB = DEFAULT_DB_ALIAS
+PARTITIONED = 'cachalot_test'
+PLAIN = 'auth_user'
+
+
+class TableCacheKeysTestCase(SimpleTestCase):
+    def legacy_key(self, table):
+        return get_table_cache_key(DB, table)
+
+    def test_disabled_feature_produces_legacy_keys(self):
+        for tenant in (None, '42'):
+            self.assertEqual(get_read_table_cache_keys(DB, PARTITIONED, tenant),
+                             [self.legacy_key(PARTITIONED)])
+            self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, tenant),
+                             [self.legacy_key(PARTITIONED)])
+
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
+    def test_partitioned_table_keys(self):
+        k_any = self.legacy_key(PARTITIONED)
+        read_unscoped = get_read_table_cache_keys(DB, PARTITIONED, None)
+        read_scoped = get_read_table_cache_keys(DB, PARTITIONED, '42')
+        write_unscoped = get_write_table_cache_keys(DB, PARTITIONED, None)
+        write_scoped = get_write_table_cache_keys(DB, PARTITIONED, '42')
+
+        # K_any stays byte-identical to the pre-feature key.
+        self.assertEqual(read_unscoped, [k_any])
+        self.assertEqual(write_unscoped[0], k_any)
+        self.assertEqual(write_scoped[0], k_any)
+
+        k_glob = write_unscoped[1]
+        k_ten = write_scoped[1]
+        self.assertEqual(read_scoped, [k_glob, k_ten])
+        self.assertEqual(len({k_any, k_glob, k_ten}), 3)
+
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
+    def test_tenants_get_distinct_keys(self):
+        self.assertNotEqual(get_read_table_cache_keys(DB, PARTITIONED, '42'),
+                            get_read_table_cache_keys(DB, PARTITIONED, '43'))
+
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
+    def test_non_partitioned_table_is_untouched(self):
+        for tenant in (None, '42'):
+            self.assertEqual(get_read_table_cache_keys(DB, PLAIN, tenant),
+                             [self.legacy_key(PLAIN)])
+            self.assertEqual(get_write_table_cache_keys(DB, PLAIN, tenant),
+                             [self.legacy_key(PLAIN)])
+
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
+    def test_tenant_normalised_to_str(self):
+        # A tenant value of 42 (int) and '42' (str) must fold to the same
+        # keys, since callers may pass either before normalisation.
+        self.assertEqual(get_read_table_cache_keys(DB, PARTITIONED, 42),
+                         get_read_table_cache_keys(DB, PARTITIONED, '42'))
+        self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, 42),
+                         get_write_table_cache_keys(DB, PARTITIONED, '42'))
+
+    def test_tenant_query_cache_key(self):
+        base = 'a' * 40
+        self.assertNotEqual(get_tenant_query_cache_key(base, '42'), base)
+        self.assertNotEqual(get_tenant_query_cache_key(base, '42'),
+                            get_tenant_query_cache_key(base, '43'))
+        self.assertEqual(get_tenant_query_cache_key(base, '42'),
+                         get_tenant_query_cache_key(base, '42'))
+
+    def test_tenant_query_cache_key_normalised_to_str(self):
+        base = 'a' * 40
+        self.assertEqual(get_tenant_query_cache_key(base, 42),
+                         get_tenant_query_cache_key(base, '42'))

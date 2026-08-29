@@ -14,6 +14,7 @@ from django.db.models.sql import Query, AggregateQuery
 from django.db.models.sql.where import ExtraWhere, WhereNode, NothingNode
 
 from .settings import ITERABLES, cachalot_settings
+from .tenancy import is_partitioned
 from .transaction import AtomicCache
 
 
@@ -127,6 +128,51 @@ def get_table_cache_key(db_alias, table):
     """
     cache_key = '%s:%s' % (db_alias, table)
     return sha1(cache_key.encode('utf-8')).hexdigest()
+
+
+# Appended to a table name to derive its partitioned keys. The suffixes must
+# not collide with a real table name; no Django table contains these.
+GLOBAL_TABLE_SUFFIX = ':__cachalot_global__'
+TENANT_TABLE_SUFFIX = ':__cachalot_tenant__:'
+
+
+def get_read_table_cache_keys(db_alias, table, tenant):
+    """
+    Invalidation keys a read of ``table`` must check under ``tenant``.
+
+    An unscoped read checks the any-write key alone; a scoped read of a
+    partitioned table checks the global key and its own tenant key.
+    """
+    get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
+    if tenant is None or not is_partitioned(table):
+        return [get_table_cache_key(db_alias, table)]
+    tenant = str(tenant)
+    return [get_table_cache_key(db_alias, table + GLOBAL_TABLE_SUFFIX),
+            get_table_cache_key(db_alias,
+                                table + TENANT_TABLE_SUFFIX + tenant)]
+
+
+def get_write_table_cache_keys(db_alias, table, tenant):
+    """
+    Invalidation keys a write to ``table`` must bump under ``tenant``.
+
+    Always the any-write key, which is byte-identical to the key cachalot used
+    before partitioning existed; plus, for a partitioned table, either the
+    global key (unscoped write) or the tenant's own key.
+    """
+    get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
+    keys = [get_table_cache_key(db_alias, table)]
+    if is_partitioned(table):
+        keys.append(get_table_cache_key(
+            db_alias,
+            table + GLOBAL_TABLE_SUFFIX if tenant is None
+            else table + TENANT_TABLE_SUFFIX + str(tenant)))
+    return keys
+
+
+def get_tenant_query_cache_key(cache_key, tenant):
+    """Fold a tenant into a query cache key so tenants cannot collide."""
+    return sha1(('%s:%s' % (cache_key, tenant)).encode('utf-8')).hexdigest()
 
 
 def _get_tables_from_sql(connection, lowercased_sql, enable_quote: bool = False):
