@@ -762,9 +762,8 @@ def observe_statement(connection, sql, params=None, failed=False):
         return
     tenant, scope = _parse_tenant_statement(sql, params)
     if scope == 'session':
-        # Sticky by design: nothing tells us when a session-scoped value
-        # changes again, only a RESET tells us where it ended up, and a
-        # reconnect is invisible, so the flag lives as long as the wrapper.
+        # Sticky: nothing but a RESET tells us where the value ended up,
+        # and a reconnect is invisible.
         connection._cachalot_session_tenant_dirty = True
     elif (scope == 'reset' and not failed
             and not connection.in_atomic_block):
