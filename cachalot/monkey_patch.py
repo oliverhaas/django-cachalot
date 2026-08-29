@@ -15,7 +15,10 @@ from django.db.transaction import Atomic, get_connection
 from .api import invalidate, LOCAL_STORAGE
 from .cache import cachalot_caches
 from .settings import cachalot_settings, ITERABLES
-from .tenancy import observe_statement, pop_tenant, push_tenant, tenancy_enabled
+from .tenancy import (
+    UNKNOWN, get_tenant, observe_statement, pop_tenant, push_tenant,
+    tenancy_enabled,
+)
 from .utils import (
     _get_table_cache_keys, _get_tables_from_sql,
     UncachableQuery, is_cachable, filter_cachable,
@@ -114,8 +117,10 @@ def _patch_write_compiler(original):
         db_alias = write_compiler.using
         table = write_compiler.query.get_meta().db_table
         if is_cachable(table):
+            tenant = get_tenant(write_compiler.connection)
             invalidate(table, db_alias=db_alias,
-                       cache_alias=cachalot_settings.CACHALOT_CACHE)
+                       cache_alias=cachalot_settings.CACHALOT_CACHE,
+                       tenant=None if tenant is UNKNOWN else tenant)
         return original(write_compiler, *args, **kwargs)
 
     return inner
@@ -169,9 +174,11 @@ def _patch_cursor():
                         tables = filter_cachable(
                             _get_tables_from_sql(connection, lowered))
                         if tables:
+                            tenant = get_tenant(connection)
                             invalidate(
                                 *tables, db_alias=connection.alias,
-                                cache_alias=cachalot_settings.CACHALOT_CACHE)
+                                cache_alias=cachalot_settings.CACHALOT_CACHE,
+                                tenant=None if tenant is UNKNOWN else tenant)
 
         return inner
 

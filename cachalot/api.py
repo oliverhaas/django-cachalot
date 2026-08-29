@@ -9,7 +9,7 @@ from .cache import cachalot_caches
 from .settings import cachalot_settings
 from .signals import post_invalidation
 from .transaction import AtomicCache
-from .utils import _invalidate_tables
+from .utils import _invalidate_tables, get_read_table_cache_keys
 
 
 try:
@@ -50,6 +50,7 @@ def invalidate(
     *tables_or_models: Tuple[Union[str, Any], ...],
     cache_alias: Optional[str] = None,
     db_alias: Optional[str] = None,
+    tenant: Optional[str] = None,
 ) -> None:
     """
     Clears what was cached by django-cachalot implying one or more SQL tables
@@ -63,11 +64,16 @@ def invalidate(
     If ``db_alias`` is specified, it only clears the SQL queries executed
     on this database, otherwise queries from all databases are cleared.
 
+    If ``tenant`` is specified, only queries belonging to that tenant are
+    invalidated.  The default, ``None``, invalidates every tenant, which is
+    what this function has always done.
+
     :arg tables_or_models: SQL tables names, models or models lookups
                            (or a combination)
     :type tables_or_models: tuple of strings or models
     :arg cache_alias: Alias from the Django ``CACHES`` setting
     :arg db_alias: Alias from the Django ``DATABASES`` setting
+    :arg tenant: Tenant to scope the invalidation to
     :returns: Nothing
     """
     send_signal = False
@@ -77,18 +83,19 @@ def invalidate(
         cache = cachalot_caches.get_cache(cache_alias, db_alias)
         if not isinstance(cache, AtomicCache):
             send_signal = True
-        _invalidate_tables(cache, db_alias, tables)
+        _invalidate_tables(cache, db_alias, tables, tenant)
         invalidated.update(tables)
 
     if send_signal:
         for table in invalidated:
-            post_invalidation.send(table, db_alias=db_alias)
+            post_invalidation.send(table, db_alias=db_alias, tenant=tenant)
 
 
 def get_last_invalidation(
     *tables_or_models: Tuple[Union[str, Any], ...],
     cache_alias: Optional[str] = None,
     db_alias: Optional[str] = None,
+    tenant: Optional[str] = None,
 ) -> float:
     """
     Returns the timestamp of the most recent invalidation of the given
@@ -101,18 +108,23 @@ def get_last_invalidation(
     If ``db_alias`` is specified, it only fetches invalidations
     for this database, otherwise invalidations for all databases are fetched.
 
+    If ``tenant`` is specified, only invalidations belonging to that tenant
+    are fetched.  The default, ``None``, fetches every tenant.
+
     :arg tables_or_models: SQL tables names, models or models lookups
                            (or a combination)
     :type tables_or_models: tuple of strings or models
     :arg cache_alias: Alias from the Django ``CACHES`` setting
     :arg db_alias: Alias from the Django ``DATABASES`` setting
+    :arg tenant: Tenant to scope the lookup to
     :returns: The timestamp of the most recent invalidation
     """
     last_invalidation = 0.0
     for cache_alias, db_alias, tables in _cache_db_tables_iterator(
             list(_get_tables(tables_or_models)), cache_alias, db_alias):
-        get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
-        table_cache_keys = [get_table_cache_key(db_alias, t) for t in tables]
+        table_cache_keys = [key for t in tables
+                            for key in get_read_table_cache_keys(db_alias, t,
+                                                                 tenant)]
         invalidations = cachalot_caches.get_cache(
             cache_alias, db_alias).get_many(table_cache_keys).values()
         if invalidations:

@@ -63,5 +63,8 @@ class AtomicCache(dict):
                 self, cachalot_settings.CACHALOT_TIMEOUT)
         # The previous `set_many` is not enough.  The parent cache needs to be
         # invalidated in case another transaction occurred in the meantime.
-        _invalidate_tables(self.parent_cache, self.db_alias,
-                           self.to_be_invalidated)
+        by_tenant = {}
+        for table, tenant in self.to_be_invalidated:
+            by_tenant.setdefault(tenant, set()).add(table)
+        for tenant, tables in by_tenant.items():
+            _invalidate_tables(self.parent_cache, self.db_alias, tables, tenant)

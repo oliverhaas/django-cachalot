@@ -1,9 +1,12 @@
+from contextlib import contextmanager
 from unittest import mock, skipUnless
 
 from django.db import DEFAULT_DB_ALIAS, connection, transaction
 from django.test import TransactionTestCase, override_settings, SimpleTestCase
 
+from ..api import get_last_invalidation, invalidate
 from ..settings import cachalot_settings
+from ..signals import post_invalidation
 from ..tenancy import (
     NOT_A_SET, UNKNOWN, are_all_shared, get_tenant, is_partitioned,
     observe_statement, parse_tenant_statement, pop_tenant, push_tenant,
@@ -12,6 +15,8 @@ from ..utils import (
     get_read_table_cache_keys, get_table_cache_key,
     get_tenant_query_cache_key, get_write_table_cache_keys,
 )
+from .models import Test
+from .test_utils import FilteredTransactionTestCase, TestUtilsMixin
 
 
 class TenancySettingsTestCase(TransactionTestCase):
@@ -437,3 +442,68 @@ class TenantPlumbingTestCase(TransactionTestCase):
                     with self.assertRaises(KeyboardInterrupt):
                         cursor.execute("SET LOCAL app.tenant_id = '42'")
             self.assertIs(get_tenant(connection), UNKNOWN)
+
+
+TENANCY = dict(CACHALOT_TENANT_SETTING='app.tenant_id',
+               CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
+
+
+@contextmanager
+def as_tenant(value):
+    """Run a block inside a transaction with ``value`` as the active tenant."""
+    with transaction.atomic():
+        observe_statement(connection, 'SET LOCAL app.tenant_id = %s', [value])
+        yield
+
+
+@override_settings(**TENANCY)
+class TenantInvalidationTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+    def last(self, tenant=None):
+        return get_last_invalidation(PARTITIONED, tenant=tenant)
+
+    def test_scoped_write_bumps_any_and_tenant_keys(self):
+        before_other = self.last('b')
+        with as_tenant('a'):
+            Test.objects.create(name='x')
+        self.assertGreater(self.last('a'), 0.0)
+        self.assertGreater(self.last(None), 0.0)
+        self.assertEqual(self.last('b'), before_other)
+
+    def test_unscoped_write_bumps_every_tenant(self):
+        Test.objects.create(name='x')
+        self.assertGreater(self.last('a'), 0.0)
+        self.assertGreater(self.last('b'), 0.0)
+        self.assertGreater(self.last(None), 0.0)
+
+    def test_explicit_invalidate_defaults_to_global(self):
+        with as_tenant('a'):
+            invalidate(Test)
+        self.assertGreater(self.last('b'), 0.0)
+
+    def test_explicit_invalidate_can_be_narrowed(self):
+        before_other = self.last('b')
+        invalidate(Test, tenant='a')
+        self.assertGreater(self.last('a'), 0.0)
+        self.assertEqual(self.last('b'), before_other)
+
+    def test_unknown_tenant_invalidates_globally(self):
+        before_other = self.last('b')
+        with transaction.atomic():
+            # A non-LOCAL SET is unparsable, so the tenant becomes UNKNOWN.
+            observe_statement(connection, "SET app.tenant_id = 'a'")
+            Test.objects.create(name='x')
+        self.assertGreater(self.last('b'), before_other)
+
+    def test_signal_carries_the_tenant(self):
+        received = []
+
+        def receiver(sender, **kwargs):
+            received.append((sender, kwargs.get('tenant')))
+
+        post_invalidation.connect(receiver)
+        try:
+            with as_tenant('a'):
+                Test.objects.create(name='x')
+        finally:
+            post_invalidation.disconnect(receiver)
+        self.assertIn((PARTITIONED, 'a'), received)
