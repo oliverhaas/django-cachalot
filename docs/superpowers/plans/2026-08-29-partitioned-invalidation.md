@@ -560,6 +560,12 @@ class TablePredicatesTestCase(SimpleTestCase):
         self.assertFalse(are_all_shared({'cachalot_testparent',
                                          'cachalot_test'}))
         self.assertFalse(are_all_shared(set()))
+
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=('cachalot_testparent',),
+                       CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
+    def test_partitioned_beats_shared(self):
+        self.assertFalse(are_all_shared({'cachalot_testparent'}))
 ```
 
 Update the import in `cachalot/tests/__init__.py`:
@@ -659,7 +665,12 @@ def are_all_shared(tables):
         # which is what keeps callers that forget to check behave like master.
         return True
     shared = cachalot_settings.CACHALOT_TENANT_SHARED_TABLES
-    return bool(tables) and set(tables).issubset(shared)
+    # A table listed as both partitioned and shared is a contradiction, and
+    # the two halves would disagree: the query key would not carry the tenant
+    # while the invalidation keys still would, so one tenant's rows could be
+    # served to another. Partitioned wins, which is the safe side.
+    return bool(tables) and all(table in shared and not is_partitioned(table)
+                                for table in tables)
 ```
 
 - [ ] **Step 4: Run the tests**
