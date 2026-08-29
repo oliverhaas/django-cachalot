@@ -803,6 +803,7 @@ def get_read_table_cache_keys(db_alias, table, tenant):
     get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
     if tenant is None or not is_partitioned(table):
         return [get_table_cache_key(db_alias, table)]
+    tenant = str(tenant)
     return [get_table_cache_key(db_alias, table + GLOBAL_TABLE_SUFFIX),
             get_table_cache_key(db_alias,
                                 table + TENANT_TABLE_SUFFIX + tenant)]
@@ -822,7 +823,7 @@ def get_write_table_cache_keys(db_alias, table, tenant):
         keys.append(get_table_cache_key(
             db_alias,
             table + GLOBAL_TABLE_SUFFIX if tenant is None
-            else table + TENANT_TABLE_SUFFIX + tenant))
+            else table + TENANT_TABLE_SUFFIX + str(tenant)))
     return keys
 
 
