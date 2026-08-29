@@ -384,6 +384,9 @@ Signal
 just after a cache invalidation (when you modify something in a SQL table).
 ``sender`` is the name of the SQL table invalidated, and a keyword argument
 ``db_alias`` explains which database is affected by the invalidation.
+A third keyword argument, ``tenant``, carries the tenant the invalidation was
+scoped to, or ``None`` when it covers every tenant; see :ref:`Tenancy` for
+the detail.
 Be careful when you specify ``sender``, as it is sensible to string type.
 To be sure, use ``Model._meta.db_table``.
 

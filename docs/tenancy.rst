@@ -82,8 +82,10 @@ transaction, because PostgreSQL discards it too.
 
 Cachalot fails closed when it cannot determine the tenant, for example on a
 connection-scoped ``SET``, a statement it cannot parse, or a statement that
-raised: queries on that connection are not cached at all for the rest of the
-transaction, and writes invalidate every tenant.
+raised: queries stop being cached and writes invalidate every tenant. That
+state lasts only until a later statement in the same transaction sets the
+tenant to a value cachalot can resolve, not unconditionally to the end of
+the transaction.
 
 Invalidating by hand
 ....................
