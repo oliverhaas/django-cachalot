@@ -337,7 +337,9 @@ NOT_A_SET = _Sentinel('NOT_A_SET')
 #: The tenant cannot be determined; callers must fail closed.
 UNKNOWN = _Sentinel('UNKNOWN')
 
-_UNQUOTED_LITERAL_RE = re.compile(r"\A[-+]?[\w.]+\Z")
+# Only a numeric literal is accepted unquoted. A bare identifier such as
+# `current_user` may be a function call, so it fails closed to UNKNOWN.
+_UNQUOTED_NUMBER_RE = re.compile(r'\A[-+]?\d+(?:\.\d+)?\Z')
 
 
 def tenancy_enabled():
@@ -384,7 +386,7 @@ def _resolve(token, sql, pos, params):
         return token[1:-1].replace("''", "'")
     if token.upper() in ('DEFAULT', 'NULL'):
         return None
-    if _UNQUOTED_LITERAL_RE.match(token):
+    if _UNQUOTED_NUMBER_RE.match(token):
         return token
     return UNKNOWN
 
@@ -1553,18 +1555,28 @@ class PostgresTenancyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         cursor.execute('SELECT set_config(%s, %s, true)',
                        ['app.tenant_id', value])
 
-    def create(self, tenant, name):
+    @contextmanager
+    def tenant_transaction(self, tenant):
+        """Open a transaction with ``tenant`` set, before any counting starts.
+
+        The ``set_config`` call is a real SELECT and would otherwise be counted
+        by ``assertNumQueries``, so it happens on entry rather than inside the
+        block the caller measures.
+        """
         with transaction.atomic():
             with connection.cursor() as cursor:
                 self.set_tenant(cursor, tenant)
+            yield
+
+    def create(self, tenant, name):
+        with self.tenant_transaction(tenant):
+            with connection.cursor() as cursor:
                 cursor.execute(
                     'INSERT INTO cachalot_test (name, public, tenant_id) '
                     'VALUES (%s, false, %s)', [name, tenant])
 
     def names(self, tenant):
-        with transaction.atomic():
-            with connection.cursor() as cursor:
-                self.set_tenant(cursor, tenant)
+        with self.tenant_transaction(tenant):
             return [t.name for t in Test.objects.all()]
 
     def test_tenants_see_only_their_own_rows_through_the_cache(self):
@@ -1582,10 +1594,14 @@ class PostgresTenancyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         self.names('a')
         self.names('b')
         self.create('a', 'row-a2')
-        with self.assertNumQueries(1):
-            self.assertEqual(sorted(self.names('a')), ['row-a', 'row-a2'])
-        with self.assertNumQueries(0):
-            self.assertEqual(self.names('b'), ['row-b'])
+        with self.tenant_transaction('a'):
+            with self.assertNumQueries(1):
+                self.assertEqual(sorted(t.name for t in Test.objects.all()),
+                                 ['row-a', 'row-a2'])
+        with self.tenant_transaction('b'):
+            with self.assertNumQueries(0):
+                self.assertEqual([t.name for t in Test.objects.all()],
+                                 ['row-b'])
 ```
 
 Add `PostgresTenancyTestCase` to the `from .tenancy import (...)` list in `cachalot/tests/__init__.py`.
