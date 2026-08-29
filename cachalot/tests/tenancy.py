@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from unittest import mock, skipUnless
+from unittest import skipUnless
 
 from django.contrib.auth.models import User
 from django.db import DEFAULT_DB_ALIAS, connection, transaction
@@ -409,6 +409,9 @@ class TenantPlumbingTestCase(TransactionTestCase):
                     'SELECT set_config(%s, %s, true)', ['app.tenant_id', '42'])
             self.assertEqual(get_tenant(connection), '42')
 
+    @skipUnless(connection.vendor == 'sqlite',
+                'SQLite only: relies on SET LOCAL syntax being rejected '
+                'outright')
     def test_cursor_failure_lands_on_unknown(self):
         # SQLite rejects `SET LOCAL` syntax outright, which drives the real
         # patched cursor through its `except BaseException` path: the error
@@ -418,6 +421,25 @@ class TenantPlumbingTestCase(TransactionTestCase):
             with self.assertRaises(Exception):
                 with connection.cursor() as cursor:
                     cursor.execute("SET LOCAL app.tenant_id = '42'")
+            self.assertIs(get_tenant(connection), UNKNOWN)
+
+    @skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+    def test_cursor_failure_lands_on_unknown_postgresql(self):
+        # PostgreSQL accepts a custom GUC happily, so a bare `SET LOCAL`
+        # never fails there the way it does on SQLite. A trailing token
+        # after a valid-looking assignment still fails on the server with a
+        # syntax error, while the regex that extracts the tenant value pays
+        # it no mind, since it does not require the match to reach the end
+        # of the statement.
+        sql = "SET LOCAL app.tenant_id = '42' GARBAGE"
+        # Confirm the statement is recognised as touching the GUC and a
+        # value extracted from it. Without this, the statement would be
+        # ignored as NOT_A_SET and the failure below would prove nothing.
+        self.assertEqual(parse_tenant_statement(sql), '42')
+        with transaction.atomic():
+            with self.assertRaises(Exception):
+                with connection.cursor() as cursor:
+                    cursor.execute(sql)
             self.assertIs(get_tenant(connection), UNKNOWN)
 
     def test_stack_balances_when_feature_disabled_before_transaction_exits(self):
@@ -453,12 +475,26 @@ class TenantPlumbingTestCase(TransactionTestCase):
         # its tenant must not be trusted.  A plain OperationalError would
         # pass against the old `except Exception` too, so this is the only
         # test that pins the wider clause down.
+        #
+        # The raw DB-API cursor cannot be mocked directly: psycopg2's cursor
+        # is a C extension type whose `execute` attribute is read-only, so
+        # `mock.patch.object` on it raises `AttributeError` instead of
+        # patching. Substituting the `cursor` attribute on the Django
+        # `CursorWrapper` instance itself works identically on every
+        # backend, since `CursorWrapper` is a plain Python object.
+        class _RaisingCursor:
+            def execute(self, *args, **kwargs):
+                raise KeyboardInterrupt
+
         with transaction.atomic():
             with connection.cursor() as cursor:
-                with mock.patch.object(cursor.cursor, 'execute',
-                                       side_effect=KeyboardInterrupt):
+                real_cursor = cursor.cursor
+                cursor.cursor = _RaisingCursor()
+                try:
                     with self.assertRaises(KeyboardInterrupt):
                         cursor.execute("SET LOCAL app.tenant_id = '42'")
+                finally:
+                    cursor.cursor = real_cursor
             self.assertIs(get_tenant(connection), UNKNOWN)
 
 
@@ -730,3 +766,93 @@ class SharedTableTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         self.assertEqual([row.name for row in rows_a_before], [])
         self.assertEqual([row.name for row in rows_b], ['from_b'])
         self.assertEqual([row.name for row in rows_a_after], [])
+
+
+@skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+@override_settings(**TENANCY)
+class PostgresTenancyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+    """
+    Drives the feature the way a real deployment does: the tenant arrives
+    only as a PostgreSQL session variable, and an RLS policy - not the ORM -
+    decides which rows a query sees.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'ALTER TABLE cachalot_test ADD COLUMN IF NOT EXISTS '
+                'tenant_id text')
+            cursor.execute('ALTER TABLE cachalot_test ENABLE ROW LEVEL '
+                           'SECURITY')
+            cursor.execute('ALTER TABLE cachalot_test FORCE ROW LEVEL '
+                           'SECURITY')
+            cursor.execute('DROP POLICY IF EXISTS cachalot_tenant_policy '
+                           'ON cachalot_test')
+            cursor.execute(
+                'CREATE POLICY cachalot_tenant_policy ON cachalot_test '
+                'USING (tenant_id IS NOT DISTINCT FROM '
+                "current_setting('app.tenant_id', true)) "
+                'WITH CHECK (true)')
+
+    def tearDown(self):
+        with connection.cursor() as cursor:
+            cursor.execute('DROP POLICY IF EXISTS cachalot_tenant_policy '
+                           'ON cachalot_test')
+            cursor.execute('ALTER TABLE cachalot_test DISABLE ROW LEVEL '
+                           'SECURITY')
+            cursor.execute('ALTER TABLE cachalot_test DROP COLUMN IF EXISTS '
+                           'tenant_id')
+        super().tearDown()
+
+    def set_tenant(self, cursor, value):
+        cursor.execute('SELECT set_config(%s, %s, true)',
+                       ['app.tenant_id', value])
+
+    @contextmanager
+    def tenant_transaction(self, tenant):
+        """Open a transaction with ``tenant`` set, before any counting starts.
+
+        The ``set_config`` call is a real SELECT and would otherwise be counted
+        by ``assertNumQueries``, so it happens on entry rather than inside the
+        block the caller measures.
+        """
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                self.set_tenant(cursor, tenant)
+            yield
+
+    def create(self, tenant, name):
+        with self.tenant_transaction(tenant):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    'INSERT INTO cachalot_test (name, public, tenant_id) '
+                    'VALUES (%s, false, %s)', [name, tenant])
+
+    def names(self, tenant):
+        with self.tenant_transaction(tenant):
+            return [t.name for t in Test.objects.all()]
+
+    def test_tenants_see_only_their_own_rows_through_the_cache(self):
+        self.create('a', 'row-a')
+        self.create('b', 'row-b')
+        self.assertEqual(self.names('a'), ['row-a'])
+        self.assertEqual(self.names('b'), ['row-b'])
+        # Served from cache this time, and still not each other's rows.
+        self.assertEqual(self.names('a'), ['row-a'])
+        self.assertEqual(self.names('b'), ['row-b'])
+
+    def test_write_in_one_tenant_spares_the_other(self):
+        self.create('a', 'row-a')
+        self.create('b', 'row-b')
+        self.names('a')
+        self.names('b')
+        self.create('a', 'row-a2')
+        with self.tenant_transaction('a'):
+            with self.assertNumQueries(1):
+                self.assertEqual(sorted(t.name for t in Test.objects.all()),
+                                 ['row-a', 'row-a2'])
+        with self.tenant_transaction('b'):
+            with self.assertNumQueries(0):
+                self.assertEqual([t.name for t in Test.objects.all()],
+                                 ['row-b'])
