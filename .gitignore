@@ -125,3 +125,6 @@ dmypy.json
 .pyre/
 
 .idea/
+
+# git worktrees
+.worktrees/
