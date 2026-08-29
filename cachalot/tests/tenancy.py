@@ -1,4 +1,7 @@
+import re
+import threading
 from contextlib import contextmanager
+from random import Random
 from unittest import skipUnless
 
 from django.contrib.auth.models import User
@@ -371,8 +374,6 @@ class TablePredicatesTestCase(SimpleTestCase):
 
     @override_settings(CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
     def test_are_all_shared_when_feature_disabled(self):
-        # With the feature off nothing is tenant-scoped, so an unlisted
-        # table still counts as shared.
         self.assertTrue(are_all_shared({'cachalot_test'}))
 
 
@@ -428,7 +429,6 @@ class TableCacheKeysTestCase(SimpleTestCase):
     @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
                        CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
     def test_tenant_normalised_to_str(self):
-        # Callers may pass either, and both must fold to the same keys.
         self.assertEqual(get_read_table_cache_keys(DB, PARTITIONED, 42),
                          get_read_table_cache_keys(DB, PARTITIONED, '42'))
         self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, 42),
@@ -507,7 +507,6 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
             with transaction.atomic():
                 observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
                 self.assertEqual(get_tenant(connection), '43')
-            # Releasing the savepoint does not undo the inner SET LOCAL.
             self.assertEqual(get_tenant(connection), '43')
         self.assertIsNone(get_tenant(connection))
 
@@ -1006,3 +1005,228 @@ class PostgresTenancyTestCase(TenantStateMixin, TestUtilsMixin,
             with self.assertNumQueries(0):
                 self.assertEqual([t.name for t in Test.objects.all()],
                                  ['row-b'])
+
+
+@skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+@override_settings(**TENANCY)
+class PlaceholderOffsetTestCase(SimpleTestCase):
+    """
+    Check the parser's parameter mapping against the driver's own.
+
+    Resolving `SET LOCAL app.tenant_id = %s` means counting the placeholders
+    before it, and psycopg's rules for what counts are not obvious: a `%s`
+    inside a string literal is one, `%%` is an escaped percent and is not,
+    and psycopg3 spells a placeholder `%b` or `%t` as well.  Getting the
+    count wrong resolves the tenant to some other parameter, which serves one
+    tenant's rows to another without any error to notice.  So rather than
+    pin a handful of cases by hand, ask the driver what it actually sent.
+    """
+
+    databases = {DEFAULT_DB_ALIAS}
+
+    #: Fragments to build statements from, each with the number of
+    #: placeholders psycopg2 will find in it.
+    FRAGMENTS = (
+        ("SELECT %s", 1),
+        ("SELECT '%s'", 1),
+        ("SELECT '100%% done'", 0),
+        ("SELECT '%%s'", 0),
+        ("SELECT %s, %s", 2),
+        ("SELECT 'a', %s", 1),
+        ("SELECT 1 /* %%s */", 0),
+        ("SELECT 1 -- no placeholder here\n", 0),
+        ("SELECT $$ %%s $$", 0),
+        ("INSERT INTO log (msg) VALUES (%s)", 1),
+        ("SELECT 'it''s %s'", 1),
+    )
+
+    def mogrify(self, sql, params):
+        with connection.cursor() as cursor:
+            return cursor.cursor.mogrify(sql, params).decode()
+
+    def driver_tenant(self, sql, params):
+        """What the server will really receive as the tenant, per psycopg."""
+        match = re.search(r"SET LOCAL app\.tenant_id = '((?:[^']|'')*)'",
+                          self.mogrify(sql, params))
+        self.assertIsNotNone(match, sql)
+        return match.group(1).replace("''", "'")
+
+    def test_parser_agrees_with_the_driver_on_every_prefix(self):
+        for prefix, count in self.FRAGMENTS:
+            sql = prefix + '; SET LOCAL app.tenant_id = %s'
+            # Distinct values, so a miscount cannot land on the right one
+            # by accident.
+            params = ['decoy-%d' % i for i in range(count)] + ['the-tenant']
+            self.assertEqual(parse_tenant_statement(sql, params),
+                             self.driver_tenant(sql, params), sql)
+
+    def test_parser_agrees_with_the_driver_on_random_statements(self):
+        random = Random(20260829)
+        for _ in range(300):
+            parts = [random.choice(self.FRAGMENTS) for _ in range(3)]
+            sql = '; '.join(part for part, _ in parts)
+            sql += '; SET LOCAL app.tenant_id = %s'
+            count = sum(n for _, n in parts)
+            params = ['decoy-%d' % i for i in range(count)] + ['the-tenant']
+            self.assertEqual(parse_tenant_statement(sql, params),
+                             self.driver_tenant(sql, params), sql)
+
+
+@skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+@override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                   CACHALOT_PARTITIONED_TABLES=(PARTITIONED,),
+                   CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
+class PostgresSharedTableTestCase(PostgresTenancyTestCase):
+    """
+    The shared-table opt-out, driven through real cursors.
+
+    Every other shared-table test injects the tenant by calling
+    ``observe_statement`` directly, so none of them exercises the cursor
+    patch, the parser and the read path together.
+    """
+
+    def test_a_shared_table_is_read_once_for_every_tenant(self):
+        TestParent.objects.create(name='shared')
+        with self.tenant_transaction('a'):
+            self.assertEqual([p.name for p in TestParent.objects.all()],
+                             ['shared'])
+        with self.tenant_transaction('b'):
+            with self.assertNumQueries(0):
+                self.assertEqual([p.name for p in TestParent.objects.all()],
+                                 ['shared'])
+
+    def test_a_partitioned_table_is_still_read_per_tenant(self):
+        self.create('a', 'row-a')
+        self.create('b', 'row-b')
+        self.names('a')
+        with self.tenant_transaction('b'):
+            with self.assertNumQueries(1):
+                self.assertEqual([t.name for t in Test.objects.all()],
+                                 ['row-b'])
+
+    def test_a_shared_read_in_a_distrusted_transaction_is_not_cached(self):
+        TestParent.objects.create(name='shared')
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                # PostgreSQL resolves the named parameter; cachalot cannot
+                # map it back to the value that was sent.
+                cursor.execute(
+                    'SELECT set_config(%(name)s, %(value)s, true)',
+                    {'name': 'app.tenant_id', 'value': 'a'})
+            self.assertIs(get_tenant(connection), UNKNOWN)
+            self.assertEqual([p.name for p in TestParent.objects.all()],
+                             ['shared'])
+        with self.tenant_transaction('a'):
+            with self.assertNumQueries(1):
+                self.assertEqual([p.name for p in TestParent.objects.all()],
+                                 ['shared'])
+
+
+@skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+@override_settings(**TENANCY)
+class PostgresConcurrentTenantTestCase(PostgresTenancyTestCase):
+    """
+    Two tenants on two connections, sharing one cache.
+
+    The tenant lives on the connection, and the cache does not, so a read
+    cached by one thread is a candidate answer for the other.  Nothing else
+    in the suite runs two tenants at once.
+    """
+
+    def run_as(self, tenant, body, results, index, barrier):
+        try:
+            with self.tenant_transaction(tenant):
+                barrier.wait(timeout=30)
+                results[index] = body()
+        except Exception as error:      # noqa: BLE001 - reported by the caller
+            results[index] = error
+        finally:
+            connection.close()
+
+    def interleave(self, bodies):
+        """Run ``bodies`` on their own connections, meeting at a barrier."""
+        results = [None] * len(bodies)
+        barrier = threading.Barrier(len(bodies))
+        threads = [
+            threading.Thread(target=self.run_as,
+                             args=(tenant, body, results, index, barrier))
+            for index, (tenant, body) in enumerate(bodies)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+            self.assertFalse(thread.is_alive(), 'thread did not finish')
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
+        return results
+
+    def read(self):
+        return [t.name for t in Test.objects.all()]
+
+    def test_simultaneous_reads_do_not_cross_tenants(self):
+        self.create('a', 'row-a')
+        self.create('b', 'row-b')
+        self.assertEqual(
+            self.interleave([('a', self.read), ('b', self.read)]),
+            [['row-a'], ['row-b']])
+        self.assertEqual(
+            self.interleave([('a', self.read), ('b', self.read)]),
+            [['row-a'], ['row-b']])
+
+    def test_a_write_racing_a_read_does_not_cross_tenants(self):
+        self.create('a', 'row-a')
+        self.create('b', 'row-b')
+        self.names('a')
+        self.names('b')
+
+        def write_b():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    'INSERT INTO cachalot_test (name, public, tenant_id) '
+                    "VALUES ('row-b2', false, 'b')")
+            return sorted(self.read())
+
+        self.assertEqual(
+            self.interleave([('a', self.read), ('b', write_b)]),
+            [['row-a'], ['row-b', 'row-b2']])
+        self.assertEqual(self.names('a'), ['row-a'])
+        self.assertEqual(sorted(self.names('b')), ['row-b', 'row-b2'])
+
+    def test_the_tenant_does_not_follow_a_connection_into_another_thread(self):
+        self.create('a', 'row-a')
+
+        def tenantless_read():
+            return get_tenant(connection)
+
+        with self.tenant_transaction('a'):
+            self.assertEqual(get_tenant(connection), 'a')
+            other = []
+            thread = threading.Thread(
+                target=lambda: other.append(tenantless_read()))
+            thread.start()
+            thread.join(timeout=30)
+        self.assertEqual(other, [None])
+
+
+@skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+@override_settings(**TENANCY)
+class PostgresReconnectTestCase(PostgresTenancyTestCase):
+    def test_distrust_survives_a_reconnect(self):
+        # PostgreSQL drops the session value when the connection goes, but
+        # cachalot cannot see that happen, so it keeps distrusting rather
+        # than guess. Pinned so a future change to it is a deliberate one.
+        with connection.cursor() as cursor:
+            cursor.execute("SET app.tenant_id = 'a'")
+        self.assertIs(get_tenant(connection), UNKNOWN)
+        connection.close()
+        self.assertIsNone(self.db_tenant())
+        self.assertIs(get_tenant(connection), UNKNOWN)
+
+    def test_a_reset_after_a_reconnect_restores_trust(self):
+        with connection.cursor() as cursor:
+            cursor.execute("SET app.tenant_id = 'a'")
+        connection.close()
+        with connection.cursor() as cursor:
+            cursor.execute('RESET app.tenant_id')
+        self.assertIsNone(get_tenant(connection))

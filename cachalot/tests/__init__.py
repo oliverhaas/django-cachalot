@@ -15,6 +15,8 @@ from .debug_toolbar import DebugToolbarTestCase
 from .tenancy import (
     ConnectionTenantTestCase, DisabledFeatureTestCase,
     ParseTenantStatementTestCase, PartitionedReadTestCase,
+    PlaceholderOffsetTestCase, PostgresConcurrentTenantTestCase,
+    PostgresReconnectTestCase, PostgresSharedTableTestCase,
     PostgresTenancyTestCase, SharedTableTestCase, TableCacheKeysTestCase,
     TablePredicatesTestCase, TenancyEnabledTestCase, TenancySettingsTestCase,
     TenantInvalidationTestCase, TenantPlumbingTestCase,
