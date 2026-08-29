@@ -149,9 +149,8 @@ def _resolve(token, sql, pos, params):
     if token == '%s':
         if params is None:
             return UNKNOWN
-        # psycopg counts a `%s` inside a literal as a placeholder too, but
-        # `%%s` is an escaped percent sign rather than one.  psycopg3 also
-        # spells a placeholder `%b` or `%t`.
+        # A placeholder counts even inside a literal, `%%s` is an escaped
+        # percent, and psycopg3 also spells one `%b` or `%t`.
         index = i = 0
         while i < pos:
             if sql[i] != '%':
