@@ -13,11 +13,11 @@ from .signals import SignalsTestCase
 from .postgres import PostgresReadTestCase
 from .debug_toolbar import DebugToolbarTestCase
 from .tenancy import (
-    ConnectionTenantTestCase, ParseTenantStatementTestCase,
-    PartitionedReadTestCase, PostgresTenancyTestCase, SharedTableTestCase,
-    TableCacheKeysTestCase, TablePredicatesTestCase, TenancyEnabledTestCase,
-    TenancySettingsTestCase, TenantInvalidationTestCase,
-    TenantPlumbingTestCase,
+    ConnectionTenantTestCase, DisabledFeatureTestCase,
+    ParseTenantStatementTestCase, PartitionedReadTestCase,
+    PostgresTenancyTestCase, SharedTableTestCase, TableCacheKeysTestCase,
+    TablePredicatesTestCase, TenancyEnabledTestCase, TenancySettingsTestCase,
+    TenantInvalidationTestCase, TenantPlumbingTestCase,
 )
 
 

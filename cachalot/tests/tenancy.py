@@ -430,6 +430,28 @@ class TableCacheKeysTestCase(SimpleTestCase):
                          get_tenant_query_cache_key(base, '42'))
 
 
+@override_settings(CACHALOT_TENANT_SETTING=None,
+                   CACHALOT_PARTITIONED_TABLES=(PARTITIONED,),
+                   CACHALOT_TENANT_SHARED_TABLES=(PARTITIONED,))
+class DisabledFeatureTestCase(SimpleTestCase):
+    """
+    With ``CACHALOT_TENANT_SETTING`` unset, cachalot must behave exactly as it
+    did before the feature existed, whatever the other settings say.
+    """
+
+    def test_key_functions_produce_only_the_legacy_key(self):
+        legacy = [get_table_cache_key(DB, PARTITIONED)]
+        for tenant in (None, '42', UNKNOWN):
+            self.assertEqual(
+                get_read_table_cache_keys(DB, PARTITIONED, tenant), legacy)
+            self.assertEqual(
+                get_write_table_cache_keys(DB, PARTITIONED, tenant), legacy)
+
+    def test_every_table_counts_as_shared(self):
+        self.assertTrue(are_all_shared({PARTITIONED}))
+        self.assertTrue(are_all_shared({PARTITIONED, PLAIN}))
+
+
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
 class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
     def tearDown(self):

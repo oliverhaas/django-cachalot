@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **No new dependencies.** Everything is stdlib or already imported by cachalot.
-- **`CACHALOT_TENANT_SETTING = None` (the default) must be a total no-op.** Cache keys byte-identical to `master`, cursor sniffing not installed, no new work on any hot path. Task 8 tests this explicitly.
+- **`CACHALOT_TENANT_SETTING = None` (the default) must be a total no-op.** Cache keys byte-identical to `master`, cursor sniffing not installed, no new work on any hot path. `DisabledFeatureTestCase` in `cachalot/tests/tenancy.py` tests this explicitly.
 - **Fail closed, always.** When the tenant cannot be determined the value is the `UNKNOWN` sentinel, which means: reads are not cached at all, and writes invalidate globally. Never guess a tenant, never retain a stale one.
 - **`K_any` must stay byte-identical to today's `get_table_cache_key(db_alias, table)`.** This is what keeps partitioning-unaware code paths (custom `CACHALOT_TABLE_KEYGEN`, third-party `invalidate()` callers, `post_migrate`) correct.
 - **All new table keys go through `cachalot_settings.CACHALOT_TABLE_KEYGEN`**, never a bare `sha1()`, so custom keygens keep working.
