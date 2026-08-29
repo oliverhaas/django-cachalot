@@ -5,6 +5,8 @@ Unreleased
 - Add per-tenant cache partitioning and invalidation for PostgreSQL
   Row-Level Security deployments (``CACHALOT_TENANT_SETTING``,
   ``CACHALOT_PARTITIONED_TABLES``, ``CACHALOT_TENANT_SHARED_TABLES``)
+- ``post_invalidation`` now always sends a ``tenant`` keyword argument, which
+  is ``None`` unless the write was made under a tenant
 
 2.9.1
 -----
