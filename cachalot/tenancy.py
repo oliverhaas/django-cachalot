@@ -141,3 +141,67 @@ def _iter_params(params):
     if isinstance(params, dict):
         return params.values()
     return params
+
+
+def get_tenant(connection):
+    """
+    The tenant currently in force on ``connection``.
+
+    Always ``None`` outside a transaction: a ``SET LOCAL`` issued in autocommit
+    is discarded by PostgreSQL, and this guard also stops a tenant value from
+    surviving on a pooled connection past the transaction that set it.
+    """
+    if not tenancy_enabled() or not connection.in_atomic_block:
+        return None
+    return getattr(connection, '_cachalot_tenant', None)
+
+
+def observe_statement(connection, sql, params=None, failed=False):
+    """
+    Record any tenant change made by a statement that just ran.
+
+    ``failed`` marks a statement that raised: it never took effect in the
+    database, so its value must not be trusted.
+    """
+    if not tenancy_enabled() or not connection.in_atomic_block:
+        return
+    tenant = parse_tenant_statement(sql, params)
+    if tenant is NOT_A_SET:
+        return
+    connection._cachalot_tenant = UNKNOWN if failed else tenant
+
+
+def push_tenant(connection):
+    """Remember the current tenant on entering an atomic block."""
+    if not tenancy_enabled():
+        return
+    stack = getattr(connection, '_cachalot_tenant_stack', None)
+    if stack is None:
+        stack = connection._cachalot_tenant_stack = []
+    stack.append(getattr(connection, '_cachalot_tenant', None))
+
+
+def pop_tenant(connection):
+    """
+    Restore the tenant remembered by the matching ``push_tenant``.
+
+    On the outermost block this restores ``None``, which is what ending the
+    transaction does to a ``SET LOCAL``. On a committed *nested* block this is
+    deliberately conservative: PostgreSQL would keep a ``SET LOCAL`` issued
+    inside a released savepoint, we revert it and fall back to unscoped
+    invalidation.
+    """
+    if not tenancy_enabled():
+        return
+    stack = getattr(connection, '_cachalot_tenant_stack', None)
+    connection._cachalot_tenant = stack.pop() if stack else None
+
+
+def is_partitioned(table):
+    return (tenancy_enabled()
+            and table in cachalot_settings.CACHALOT_PARTITIONED_TABLES)
+
+
+def are_all_shared(tables):
+    shared = cachalot_settings.CACHALOT_TENANT_SHARED_TABLES
+    return bool(tables) and set(tables).issubset(shared)

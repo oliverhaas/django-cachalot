@@ -129,3 +129,89 @@ class TenancyEnabledTestCase(SimpleTestCase):
         from ..tenancy import tenancy_enabled
         with override_settings(CACHALOT_TENANT_SETTING='app.tenant_id'):
             self.assertTrue(tenancy_enabled())
+
+
+from django.db import connection, transaction
+
+from ..tenancy import (
+    are_all_shared, get_tenant, is_partitioned, observe_statement,
+    pop_tenant, push_tenant,
+)
+
+
+@override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
+class ConnectionTenantTestCase(TransactionTestCase):
+    def tearDown(self):
+        connection._cachalot_tenant = None
+        connection._cachalot_tenant_stack = []
+
+    def test_no_tenant_outside_a_transaction(self):
+        observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+        self.assertIsNone(get_tenant(connection))
+
+    def test_tenant_recorded_inside_a_transaction(self):
+        with transaction.atomic():
+            self.assertIsNone(get_tenant(connection))
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            self.assertEqual(get_tenant(connection), '42')
+        self.assertIsNone(get_tenant(connection))
+
+    def test_unrelated_statement_leaves_tenant_alone(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            observe_statement(connection, 'SELECT 1')
+            self.assertEqual(get_tenant(connection), '42')
+
+    def test_failed_statement_is_unknown(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'",
+                              failed=True)
+            self.assertIs(get_tenant(connection), UNKNOWN)
+
+    def test_unparsable_statement_is_unknown(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            observe_statement(connection, "SET app.tenant_id = '43'")
+            self.assertIs(get_tenant(connection), UNKNOWN)
+
+    def test_nested_atomic_restores_outer_tenant(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            push_tenant(connection)
+            observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
+            self.assertEqual(get_tenant(connection), '43')
+            pop_tenant(connection)
+            self.assertEqual(get_tenant(connection), '42')
+
+    def test_pop_without_push_clears(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            pop_tenant(connection)
+            self.assertIsNone(get_tenant(connection))
+
+    def test_disabled_feature_records_nothing(self):
+        with override_settings(CACHALOT_TENANT_SETTING=None):
+            with transaction.atomic():
+                observe_statement(connection,
+                                  "SET LOCAL app.tenant_id = '42'")
+                self.assertIsNone(get_tenant(connection))
+
+
+class TablePredicatesTestCase(SimpleTestCase):
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_PARTITIONED_TABLES=('cachalot_test',))
+    def test_is_partitioned(self):
+        self.assertTrue(is_partitioned('cachalot_test'))
+        self.assertFalse(is_partitioned('cachalot_testparent'))
+
+    @override_settings(CACHALOT_PARTITIONED_TABLES=('cachalot_test',))
+    def test_is_partitioned_requires_the_feature_to_be_on(self):
+        self.assertFalse(is_partitioned('cachalot_test'))
+
+    @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                       CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
+    def test_are_all_shared(self):
+        self.assertTrue(are_all_shared({'cachalot_testparent'}))
+        self.assertFalse(are_all_shared({'cachalot_testparent',
+                                         'cachalot_test'}))
+        self.assertFalse(are_all_shared(set()))

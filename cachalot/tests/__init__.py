@@ -12,8 +12,11 @@ from .api import APITestCase, CommandTestCase
 from .signals import SignalsTestCase
 from .postgres import PostgresReadTestCase
 from .debug_toolbar import DebugToolbarTestCase
-from .tenancy import (ParseTenantStatementTestCase, TenancyEnabledTestCase,
-                      TenancySettingsTestCase)
+from .tenancy import (
+    ConnectionTenantTestCase, ParseTenantStatementTestCase,
+    TablePredicatesTestCase, TenancyEnabledTestCase,
+    TenancySettingsTestCase,
+)
 
 
 @receiver(setting_changed)
