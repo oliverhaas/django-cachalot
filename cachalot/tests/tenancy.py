@@ -17,7 +17,7 @@ from ..utils import (
     TENANT_TABLE_SUFFIX, get_read_table_cache_keys, get_table_cache_key,
     get_tenant_query_cache_key, get_write_table_cache_keys,
 )
-from .models import Test
+from .models import Test, TestParent
 from .test_utils import FilteredTransactionTestCase, TestUtilsMixin
 
 
@@ -578,3 +578,98 @@ class TenantInvalidationTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         self.assertGreater(expected, 0.0)
         self.assertEqual(get_last_invalidation(PARTITIONED, tenant=UNKNOWN),
                          expected)
+
+
+@override_settings(**TENANCY)
+class PartitionedReadTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+    def read(self, tenant=None):
+        if tenant is None:
+            return list(Test.objects.all())
+        with as_tenant(tenant):
+            return list(Test.objects.all())
+
+    def write(self, tenant=None, name='x'):
+        if tenant is None:
+            Test.objects.create(name=name)
+        else:
+            with as_tenant(tenant):
+                Test.objects.create(name=name)
+
+    def test_tenants_do_not_share_cached_results(self):
+        with self.assertNumQueries(1):
+            self.read('a')
+        with self.assertNumQueries(1):
+            self.read('b')
+        with self.assertNumQueries(0):
+            self.read('a')
+        with self.assertNumQueries(0):
+            self.read('b')
+
+    def test_scoped_write_spares_another_tenant(self):
+        self.read('a')
+        self.read('b')
+        self.write('a')
+        with self.assertNumQueries(0):
+            self.read('b')
+        with self.assertNumQueries(1):
+            self.read('a')
+
+    def test_scoped_write_invalidates_unscoped_reads(self):
+        with self.assertNumQueries(1):
+            self.read()
+        with self.assertNumQueries(0):
+            self.read()
+        self.write('a')
+        with self.assertNumQueries(1):
+            self.read()
+
+    def test_unscoped_write_invalidates_every_tenant(self):
+        self.read('a')
+        self.read('b')
+        self.write()
+        with self.assertNumQueries(1):
+            self.read('a')
+        with self.assertNumQueries(1):
+            self.read('b')
+
+    def test_unscoped_and_scoped_reads_do_not_share(self):
+        with self.assertNumQueries(1):
+            self.read()
+        with self.assertNumQueries(1):
+            self.read('a')
+
+    def test_unknown_tenant_is_never_cached(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET app.tenant_id = 'a'")
+            with self.assertNumQueries(1):
+                list(Test.objects.all())
+            with self.assertNumQueries(1):
+                list(Test.objects.all())
+
+
+@override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
+                   CACHALOT_PARTITIONED_TABLES=(PARTITIONED,),
+                   CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
+class SharedTableTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+    def test_shared_table_queries_are_reused_across_tenants(self):
+        with as_tenant('a'):
+            with self.assertNumQueries(1):
+                list(TestParent.objects.all())
+        with as_tenant('b'):
+            with self.assertNumQueries(0):
+                list(TestParent.objects.all())
+
+    def test_non_partitioned_table_keeps_single_key_semantics(self):
+        # auth_user is neither partitioned nor shared: its query key still
+        # carries the tenant, but any write to it invalidates every tenant.
+        with as_tenant('a'):
+            with self.assertNumQueries(1):
+                list(User.objects.all())
+        with as_tenant('a'):
+            with self.assertNumQueries(0):
+                list(User.objects.all())
+        with as_tenant('b'):
+            User.objects.create_user('u1')
+        with as_tenant('a'):
+            with self.assertNumQueries(1):
+                list(User.objects.all())

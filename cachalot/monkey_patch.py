@@ -16,11 +16,11 @@ from .api import invalidate, LOCAL_STORAGE
 from .cache import cachalot_caches
 from .settings import cachalot_settings, ITERABLES
 from .tenancy import (
-    UNKNOWN, get_tenant, observe_statement, pop_tenant, push_tenant,
-    tenancy_enabled,
+    UNKNOWN, are_all_shared, get_tenant, observe_statement, pop_tenant,
+    push_tenant, tenancy_enabled,
 )
 from .utils import (
-    _get_table_cache_keys, _get_tables_from_sql,
+    _get_table_cache_keys, _get_tables_from_sql, get_tenant_query_cache_key,
     UncachableQuery, is_cachable, filter_cachable,
 )
 
@@ -96,11 +96,20 @@ def _patch_compiler(original):
                 or isinstance(compiler, WRITE_COMPILERS):
             return execute_query_func()
 
+        tenant = get_tenant(compiler.connection)
+        if tenant is UNKNOWN:
+            # We cannot tell which tenant this query belongs to, so we must
+            # not serve it from cache nor put it in one.
+            return execute_query_func()
+
         try:
             cache_key = cachalot_settings.CACHALOT_QUERY_KEYGEN(compiler)
-            table_cache_keys = _get_table_cache_keys(compiler)
+            tables, table_cache_keys = _get_table_cache_keys(compiler, tenant)
         except (EmptyResultSet, UncachableQuery):
             return execute_query_func()
+
+        if tenant is not None and not are_all_shared(tables):
+            cache_key = get_tenant_query_cache_key(cache_key, tenant)
 
         return _get_result_or_execute_query(
             execute_query_func,

@@ -14,9 +14,9 @@ from .postgres import PostgresReadTestCase
 from .debug_toolbar import DebugToolbarTestCase
 from .tenancy import (
     ConnectionTenantTestCase, ParseTenantStatementTestCase,
-    TableCacheKeysTestCase, TablePredicatesTestCase, TenancyEnabledTestCase,
-    TenancySettingsTestCase, TenantInvalidationTestCase,
-    TenantPlumbingTestCase,
+    PartitionedReadTestCase, SharedTableTestCase, TableCacheKeysTestCase,
+    TablePredicatesTestCase, TenancyEnabledTestCase, TenancySettingsTestCase,
+    TenantInvalidationTestCase, TenantPlumbingTestCase,
 )
 
 

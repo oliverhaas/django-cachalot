@@ -350,11 +350,13 @@ def _get_tables(db_alias, query, compiler=False):
     return tables
 
 
-def _get_table_cache_keys(compiler):
+def _get_table_cache_keys(compiler, tenant=None):
+    """Returns the tables a query reads and the keys that invalidate it."""
     db_alias = compiler.using
-    get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
-    return [get_table_cache_key(db_alias, t)
-            for t in _get_tables(db_alias, compiler.query, compiler)]
+    tables = _get_tables(db_alias, compiler.query, compiler)
+    return tables, [key for table in tables
+                    for key in get_read_table_cache_keys(db_alias, table,
+                                                         tenant)]
 
 
 def _invalidate_tables(cache, db_alias, tables, tenant=None):
