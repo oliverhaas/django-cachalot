@@ -803,8 +803,13 @@ def get_read_table_cache_keys(db_alias, table, tenant):
 
     An unscoped read checks the any-write key alone; a scoped read of a
     partitioned table checks the global key and its own tenant key.
+
+    ``UNKNOWN`` is normalised to ``None`` here rather than at each call site,
+    so no entry point can derive a key from the sentinel's repr.
     """
     get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
+    if tenant is UNKNOWN:
+        tenant = None
     if tenant is None or not is_partitioned(table):
         return [get_table_cache_key(db_alias, table)]
     tenant = str(tenant)
@@ -820,8 +825,13 @@ def get_write_table_cache_keys(db_alias, table, tenant):
     Always the any-write key, which is byte-identical to the key cachalot used
     before partitioning existed; plus, for a partitioned table, either the
     global key (unscoped write) or the tenant's own key.
+
+    ``UNKNOWN`` is normalised to ``None`` here rather than at each call site,
+    so no entry point can derive a key from the sentinel's repr.
     """
     get_table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN
+    if tenant is UNKNOWN:
+        tenant = None
     keys = [get_table_cache_key(db_alias, table)]
     if is_partitioned(table):
         keys.append(get_table_cache_key(
