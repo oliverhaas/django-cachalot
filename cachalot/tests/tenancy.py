@@ -558,10 +558,9 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
 
     @skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
     def test_cursor_failure_lands_on_unknown_postgresql(self):
-        # PostgreSQL accepts any custom GUC, so a bare `SET LOCAL` never
-        # fails there. A trailing token makes the server reject it while the
-        # parser, which need not match to the end, still reads the value -
-        # asserted first, or the failure below would prove nothing.
+        # PostgreSQL accepts any custom GUC, so a trailing token is what
+        # makes the server reject it while the parser still reads the value.
+        # Asserted first, or the failure below would prove nothing.
         sql = "SET LOCAL app.tenant_id = '42' GARBAGE"
         self.assertEqual(parse_tenant_statement(sql), '42')
         with transaction.atomic():
@@ -592,13 +591,10 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
             self.assertIsNone(get_tenant(connection))
 
     def test_interrupted_statement_lands_on_unknown(self):
-        # A statement killed by KeyboardInterrupt did not take effect
-        # either. An OperationalError would pass against a plain
-        # `except Exception` too, so only this pins the wider clause down.
-        #
-        # psycopg2's cursor is a C type with a read-only `execute`, so it
-        # cannot be patched; swapping the attribute on Django's
-        # `CursorWrapper` works on every backend instead.
+        # Only a BaseException pins the wider `except` clause down; an
+        # OperationalError would pass against a plain `except Exception`.
+        # psycopg2's cursor is a C type with a read-only `execute`, hence
+        # the swap on Django's wrapper instead.
         class _RaisingCursor:
             def execute(self, *args, **kwargs):
                 raise KeyboardInterrupt
@@ -851,9 +847,8 @@ class SharedTableTestCase(TenantStateMixin, TestUtilsMixin,
     def test_partitioned_and_shared_table_does_not_leak_across_tenants(self):
         # Listed as both, the query key used to stay unscoped while the
         # invalidation keys stayed per-tenant, so b's rows landed in the slot
-        # a read from. Tenant a's key is never touched by b's write - that is
-        # the point of partitioning - so a's last read is legitimately a
-        # cache hit; what it returns is what these assertions pin down.
+        # a read from. a's last read is legitimately a cache hit; what it
+        # returns is the point.
         with as_tenant('a'):
             with self.assertNumQueries(1):
                 rows_a_before = list(TestParent.objects.all())
