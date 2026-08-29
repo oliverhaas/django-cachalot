@@ -140,7 +140,7 @@ class TenancySettingsTestCase(TransactionTestCase):
         self.assertEqual(cachalot_settings.CACHALOT_PARTITIONED_TABLES,
                          frozenset(('cachalot_test',)))
 
-    @override_settings(CACHALOT_PARTITIONED_APPS=('cachalot.tests',))
+    @override_settings(CACHALOT_PARTITIONED_APPS=('cachalot',))
     def test_partitioned_apps_expand_to_table_names(self):
         self.assertIn('cachalot_test',
                       cachalot_settings.CACHALOT_PARTITIONED_TABLES)
