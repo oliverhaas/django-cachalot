@@ -119,7 +119,6 @@ class ParseTenantStatementTestCase(SimpleTestCase):
     def test_unresolvable_values_are_unknown(self):
         self.assertIs(
             self.parse('SET LOCAL app.tenant_id = %(t)s', {'t': '42'}), UNKNOWN)
-        # A bare identifier may be a function call, so we do not evaluate it.
         self.assertIs(self.parse('SET LOCAL app.tenant_id = current_user'),
                       UNKNOWN)
         self.assertIs(
@@ -173,9 +172,8 @@ class ParseTenantStatementTestCase(SimpleTestCase):
             '9')
 
     def test_placeholder_inside_a_literal_still_counts(self):
-        # psycopg counts a `%s` inside a literal as a placeholder too - a
-        # literal percent must be written `%%` - so the tenant is the second
-        # parameter here, not the first.
+        # A placeholder counts even inside a literal, so the tenant is the
+        # second parameter here.
         self.assertEqual(
             self.parse("INSERT INTO log (msg) VALUES ('a %s b'); "
                        'SET LOCAL app.tenant_id = %s', ['msg', '9']),
@@ -296,7 +294,6 @@ class ConnectionTenantTestCase(TenantStateMixin, TransactionTestCase):
         with transaction.atomic():
             observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
             self.assertEqual(get_tenant(connection), '43')
-        # The session value is unmasked again once the transaction is over.
         self.assertIs(get_tenant(connection), UNKNOWN)
 
     def test_reset_trusts_the_connection_again(self):
@@ -333,7 +330,6 @@ class ConnectionTenantTestCase(TenantStateMixin, TransactionTestCase):
 
     def test_outermost_push_clears_dirty_connection(self):
         with transaction.atomic():
-            # A tenant with an empty stack is what a missed pop leaves.
             connection._cachalot_tenant = '99'
             connection._cachalot_tenant_stack = []
             push_tenant(connection)
@@ -375,8 +371,8 @@ class TablePredicatesTestCase(SimpleTestCase):
 
     @override_settings(CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
     def test_are_all_shared_when_feature_disabled(self):
-        # With the feature off nothing is tenant-scoped, so a table nobody
-        # listed as shared still counts as one.
+        # With the feature off nothing is tenant-scoped, so an unlisted
+        # table still counts as shared.
         self.assertTrue(are_all_shared({'cachalot_test'}))
 
 
@@ -405,7 +401,6 @@ class TableCacheKeysTestCase(SimpleTestCase):
         write_unscoped = get_write_table_cache_keys(DB, PARTITIONED, None)
         write_scoped = get_write_table_cache_keys(DB, PARTITIONED, '42')
 
-        # K_any stays byte-identical to the pre-feature key.
         self.assertEqual(read_unscoped, [k_any])
         self.assertEqual(write_unscoped[0], k_any)
         self.assertEqual(write_scoped[0], k_any)
@@ -433,8 +428,7 @@ class TableCacheKeysTestCase(SimpleTestCase):
     @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
                        CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
     def test_tenant_normalised_to_str(self):
-        # A tenant value of 42 (int) and '42' (str) must fold to the same
-        # keys, since callers may pass either before normalisation.
+        # Callers may pass either, and both must fold to the same keys.
         self.assertEqual(get_read_table_cache_keys(DB, PARTITIONED, 42),
                          get_read_table_cache_keys(DB, PARTITIONED, '42'))
         self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, 42),
@@ -443,8 +437,8 @@ class TableCacheKeysTestCase(SimpleTestCase):
     @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
                        CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
     def test_unknown_tenant_normalised_to_none_in_key_functions(self):
-        # UNKNOWN must fold to the same single legacy key as an unscoped
-        # (None) tenant, not derive a key from the sentinel's repr.
+        # The same single legacy key as an unscoped tenant, not one derived
+        # from the sentinel's repr.
         self.assertEqual(get_read_table_cache_keys(DB, PARTITIONED, UNKNOWN),
                          get_read_table_cache_keys(DB, PARTITIONED, None))
         self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, UNKNOWN),
@@ -691,8 +685,7 @@ class TenantInvalidationTestCase(TenantStateMixin, TestUtilsMixin,
         self.assertGreater(self.last('a'), 0.0)
         self.assertGreater(self.last('b'), 0.0)
 
-        # Built by hand: get_write_table_cache_keys normalises UNKNOWN and
-        # can no longer mint a key from the sentinel's repr.
+        # Built by hand: the key function normalises UNKNOWN away.
         bogus_key = cachalot_settings.CACHALOT_TABLE_KEYGEN(
             DEFAULT_DB_ALIAS, PARTITIONED + TENANT_TABLE_SUFFIX + str(UNKNOWN))
         cache = cachalot_caches.get_cache(db_alias=DEFAULT_DB_ALIAS)
@@ -841,7 +834,6 @@ class SharedTableTestCase(TenantStateMixin, TestUtilsMixin,
             with self.assertNumQueries(1):
                 list(User.objects.all())
         with as_tenant('b'):
-            # Not partitioned, but still not tenant a's cache entry.
             with self.assertNumQueries(1):
                 list(User.objects.all())
         with as_tenant('a'):
@@ -955,7 +947,6 @@ class PostgresTenancyTestCase(TenantStateMixin, TestUtilsMixin,
         self.create('b', 'row-b')
         self.assertEqual(self.names('a'), ['row-a'])
         self.assertEqual(self.names('b'), ['row-b'])
-        # Served from cache this time, and still not each other's rows.
         self.assertEqual(self.names('a'), ['row-a'])
         self.assertEqual(self.names('b'), ['row-b'])
 
