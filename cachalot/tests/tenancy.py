@@ -1,7 +1,11 @@
+from django.db import connection, transaction
 from django.test import TransactionTestCase, override_settings, SimpleTestCase
 
 from ..settings import cachalot_settings
-from ..tenancy import NOT_A_SET, UNKNOWN, parse_tenant_statement
+from ..tenancy import (
+    NOT_A_SET, UNKNOWN, are_all_shared, get_tenant, is_partitioned,
+    observe_statement, parse_tenant_statement, pop_tenant, push_tenant,
+)
 
 
 class TenancySettingsTestCase(TransactionTestCase):
@@ -131,14 +135,6 @@ class TenancyEnabledTestCase(SimpleTestCase):
             self.assertTrue(tenancy_enabled())
 
 
-from django.db import connection, transaction
-
-from ..tenancy import (
-    are_all_shared, get_tenant, is_partitioned, observe_statement,
-    pop_tenant, push_tenant,
-)
-
-
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
 class ConnectionTenantTestCase(TransactionTestCase):
     def tearDown(self):
@@ -196,6 +192,26 @@ class ConnectionTenantTestCase(TransactionTestCase):
                                   "SET LOCAL app.tenant_id = '42'")
                 self.assertIsNone(get_tenant(connection))
 
+    def test_outermost_push_clears_dirty_connection(self):
+        with transaction.atomic():
+            # Simulate a missed pop by manually setting _cachalot_tenant
+            # with an empty stack, as if a previous transaction leaked
+            connection._cachalot_tenant = '99'
+            connection._cachalot_tenant_stack = []
+            push_tenant(connection)
+            self.assertIsNone(get_tenant(connection))
+
+    def test_nested_push_does_not_clear(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '7'")
+            push_tenant(connection)
+            # After outermost push, live value was cleared
+            self.assertIsNone(get_tenant(connection))
+            # But the stack captured the value
+            push_tenant(connection)
+            # Nested push does not clear the live value
+            self.assertIsNone(get_tenant(connection))
+
 
 class TablePredicatesTestCase(SimpleTestCase):
     @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
@@ -215,3 +231,8 @@ class TablePredicatesTestCase(SimpleTestCase):
         self.assertFalse(are_all_shared({'cachalot_testparent',
                                          'cachalot_test'}))
         self.assertFalse(are_all_shared(set()))
+
+    def test_are_all_shared_when_feature_disabled(self):
+        # With the feature off, are_all_shared should return True to behave
+        # like master (no tenant scoping), even if the table is not shared.
+        self.assertTrue(are_all_shared({'cachalot_test'}))
