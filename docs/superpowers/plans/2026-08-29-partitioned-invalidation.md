@@ -1353,10 +1353,8 @@ def _invalidate_tables(cache, db_alias, tables, tenant=None):
     if not tables:
         return
     if tenant is UNKNOWN:
-        # Fail closed: an unresolvable tenant invalidates globally rather
-        # than minting a `<cachalot UNKNOWN>` pseudo-tenant key nothing ever
-        # reads.  Normalised here so the public `invalidate(..., tenant=...)`
-        # is covered too, not just cachalot's own call sites.
+        # Fail closed, and here rather than at the call sites so that the
+        # public `invalidate(..., tenant=...)` is covered too.
         tenant = None
     now = time()
     cache.set_many(
