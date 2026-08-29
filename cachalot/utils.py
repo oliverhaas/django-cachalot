@@ -14,7 +14,7 @@ from django.db.models.sql import Query, AggregateQuery
 from django.db.models.sql.where import ExtraWhere, WhereNode, NothingNode
 
 from .settings import ITERABLES, cachalot_settings
-from .tenancy import is_partitioned
+from .tenancy import UNKNOWN, is_partitioned
 from .transaction import AtomicCache
 
 
@@ -351,6 +351,12 @@ def _invalidate_tables(cache, db_alias, tables, tenant=None):
     tables = filter_cachable(set(tables))
     if not tables:
         return
+    if tenant is UNKNOWN:
+        # Fail closed: an unresolvable tenant invalidates globally rather
+        # than minting a `<cachalot UNKNOWN>` pseudo-tenant key nothing ever
+        # reads.  Normalised here so the public `invalidate(..., tenant=...)`
+        # is covered too, not just cachalot's own call sites.
+        tenant = None
     now = time()
     cache.set_many(
         {key: now
@@ -359,4 +365,9 @@ def _invalidate_tables(cache, db_alias, tables, tenant=None):
         cachalot_settings.CACHALOT_TIMEOUT)
 
     if isinstance(cache, AtomicCache):
-        cache.to_be_invalidated.update((table, tenant) for table in tables)
+        # A non-partitioned table ignores the tenant when its keys are built,
+        # so buffering one would emit a redundant `post_invalidation` signal
+        # per tenant for a table master signals once.
+        cache.to_be_invalidated.update(
+            (table, tenant if is_partitioned(table) else None)
+            for table in tables)

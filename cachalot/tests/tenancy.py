@@ -1,10 +1,12 @@
 from contextlib import contextmanager
 from unittest import mock, skipUnless
 
+from django.contrib.auth.models import User
 from django.db import DEFAULT_DB_ALIAS, connection, transaction
 from django.test import TransactionTestCase, override_settings, SimpleTestCase
 
 from ..api import get_last_invalidation, invalidate
+from ..cache import cachalot_caches
 from ..settings import cachalot_settings
 from ..signals import post_invalidation
 from ..tenancy import (
@@ -507,3 +509,52 @@ class TenantInvalidationTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         finally:
             post_invalidation.disconnect(receiver)
         self.assertIn((PARTITIONED, 'a'), received)
+
+    def test_invalidate_with_unknown_tenant_behaves_like_global(self):
+        invalidate(Test, tenant=UNKNOWN)
+        self.assertGreater(self.last(None), 0.0)
+        self.assertGreater(self.last('a'), 0.0)
+        self.assertGreater(self.last('b'), 0.0)
+
+        # No pseudo-tenant key was minted for the sentinel's repr.
+        bogus_key = get_write_table_cache_keys(
+            DEFAULT_DB_ALIAS, PARTITIONED, UNKNOWN)[1]
+        cache = cachalot_caches.get_cache(db_alias=DEFAULT_DB_ALIAS)
+        self.assertEqual(cache.get_many([bogus_key]), {})
+
+    def test_shared_table_write_signals_once_across_tenants(self):
+        received = []
+
+        def receiver(sender, **kwargs):
+            received.append((sender, kwargs.get('tenant')))
+
+        post_invalidation.connect(receiver)
+        try:
+            with transaction.atomic():
+                with as_tenant('a'):
+                    User.objects.create_user('user_a')
+                with as_tenant('b'):
+                    User.objects.create_user('user_b')
+        finally:
+            post_invalidation.disconnect(receiver)
+        plain_signals = [pair for pair in received if pair[0] == PLAIN]
+        self.assertEqual(plain_signals, [(PLAIN, None)])
+
+    def test_partitioned_table_write_still_signals_once_per_tenant(self):
+        received = []
+
+        def receiver(sender, **kwargs):
+            received.append((sender, kwargs.get('tenant')))
+
+        post_invalidation.connect(receiver)
+        try:
+            with transaction.atomic():
+                with as_tenant('a'):
+                    Test.objects.create(name='x')
+                with as_tenant('b'):
+                    Test.objects.create(name='y')
+        finally:
+            post_invalidation.disconnect(receiver)
+        partitioned_tenants = sorted(
+            tenant for sender, tenant in received if sender == PARTITIONED)
+        self.assertEqual(partitioned_tenants, ['a', 'b'])
