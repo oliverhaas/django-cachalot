@@ -49,6 +49,93 @@ def _compile(guc):
     )
 
 
+#: The opening (or closing) delimiter of a dollar-quoted string, tag included.
+_DOLLAR_TAG_RE = re.compile(r'\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$')
+
+#: Characters that may precede the ``E`` of an ``E'...'`` string only if it is
+#: not simply the tail of an identifier or keyword (``LIKE'x'`` is not one).
+_IDENT_CHARS = frozenset(
+    'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$')
+
+
+def _quoted_spans(sql):
+    """
+    The character spans of ``sql`` that are quoted text or comment.
+
+    A match starting inside one of these is not a statement at all, only text
+    that looks like one, so the caller discards it.  One left-to-right pass,
+    no backtracking.  An unterminated construct swallows the rest of the
+    statement, which is the safe direction: whatever follows is discarded too.
+    """
+    spans = []
+    i = 0
+    length = len(sql)
+    while i < length:
+        char = sql[i]
+        following = sql[i + 1:i + 2]
+        if char == '-' and following == '-':
+            end = sql.find('\n', i + 2)
+            end = length if end == -1 else end
+            spans.append((i, end))
+            i = end
+        elif char == '/' and following == '*':
+            # Block comments nest in PostgreSQL, unlike in the SQL standard.
+            depth = 1
+            j = i + 2
+            while j < length and depth:
+                pair = sql[j:j + 2]
+                if pair == '/*':
+                    depth += 1
+                    j += 2
+                elif pair == '*/':
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            spans.append((i, min(j, length)))
+            i = min(j, length)
+        elif char == '$':
+            match = _DOLLAR_TAG_RE.match(sql, i)
+            if match is None:
+                i += 1
+                continue
+            tag = match.group()
+            end = sql.find(tag, match.end())
+            end = length if end == -1 else end + len(tag)
+            spans.append((i, end))
+            i = end
+        elif (char in '\'"'
+                or (char in 'Ee' and following == "'"
+                    and (i == 0 or sql[i - 1] not in _IDENT_CHARS))):
+            start = i
+            backslash_escapes = char in 'Ee'
+            if backslash_escapes:
+                i += 1
+            quote = sql[i]
+            i += 1
+            while i < length:
+                current = sql[i]
+                if backslash_escapes and current == '\\':
+                    i += 2
+                elif current != quote:
+                    i += 1
+                elif sql[i + 1:i + 2] == quote:
+                    # A doubled quote is one embedded quote, not the end.
+                    i += 2
+                else:
+                    i += 1
+                    break
+            i = min(i, length)
+            spans.append((start, i))
+        else:
+            i += 1
+    return spans
+
+
+def _is_quoted(spans, pos):
+    return any(start <= pos < end for start, end in spans)
+
+
 def _param_index(sql, pos):
     """Index into ``params`` of the ``%s`` placeholder starting at ``pos``."""
     return sql.count('%s', 0, pos)
@@ -81,60 +168,88 @@ def parse_tenant_statement(sql, params=None):
     it clears it, a ``str`` if it sets it, and ``UNKNOWN`` if it touches it in
     a form we decline to interpret.
     """
+    return _parse_tenant_statement(sql, params)[0]
+
+
+def _parse_tenant_statement(sql, params=None):
+    """
+    As ``parse_tenant_statement``, but also reporting *how* the setting was
+    touched, which decides how long the change outlives the statement:
+
+    ``'none'``
+        Nothing touched the setting; the value is ``NOT_A_SET``.
+    ``'local'``
+        ``SET LOCAL`` or ``set_config(..., true)``: the value dies with the
+        transaction, and we can follow it.
+    ``'reset'``
+        ``RESET``, or a session-scoped ``SET ... = DEFAULT``: session-scoped,
+        but its end state is exactly the ``None`` we model as "no tenant".
+    ``'session'``
+        Anything else that touches it.  The value outlives the statement
+        somewhere we cannot follow, so it is ``UNKNOWN``.
+    """
     guc = cachalot_settings.CACHALOT_TENANT_SETTING
-    if guc is None or guc.lower() not in sql.lower():
+    if guc is None:
+        return NOT_A_SET, 'none'
+    lowered = sql.lower()
+    if guc.lower() not in lowered:
         # The GUC name must appear literally, except when it arrives as a
-        # set_config() parameter, which the check below covers.
-        if not (params and guc is not None
+        # set_config() parameter.  Scanning the parameters is worth it only
+        # for that form, and `params` can be very long.
+        if not ('set_config' in lowered and params
                 and any(p == guc for p in _iter_params(params))):
-            return NOT_A_SET
-    if '%(' in sql:
-        # pyformat placeholders: we cannot map positions to parameters.
-        return UNKNOWN
+            return NOT_A_SET, 'none'
 
     set_re, reset_re, set_config_re = _compile(guc)
 
-    # Collect all matches that touch the configured GUC.
-    # Fail closed if more than one construct touches it (ambiguous end state).
+    # Collect every construct that touches the configured GUC, discarding the
+    # ones that only look like one because they sit in a literal or comment.
+    spans = _quoted_spans(sql)
     matches = []
 
-    # Check set_config matches
     for match in set_config_re.finditer(sql):
+        if _is_quoted(spans, match.start()):
+            continue
         name = _resolve(match.group('name'), sql, match.start('name'), params)
         if name is UNKNOWN or name == guc:
             matches.append(('set_config', match, name))
 
-    # Check SET matches (all of them, including non-LOCAL)
     for match in set_re.finditer(sql):
-        matches.append(('set', match, None))
+        if not _is_quoted(spans, match.start()):
+            matches.append(('set', match, None))
 
-    # Check RESET matches
     for match in reset_re.finditer(sql):
-        matches.append(('reset', match, None))
+        if not _is_quoted(spans, match.start()):
+            matches.append(('reset', match, None))
 
-    # If more than one construct touches the GUC, we cannot determine the
-    # final state confidently, so fail closed to UNKNOWN.
+    if not matches:
+        return NOT_A_SET, 'none'
+    if '%(' in sql:
+        # pyformat placeholders: we cannot map positions to parameters.
+        return UNKNOWN, 'session'
     if len(matches) > 1:
-        return UNKNOWN
-    elif len(matches) == 0:
-        return NOT_A_SET
+        # We cannot tell which construct wins, so we trust none of them.
+        return UNKNOWN, 'session'
 
-    # Exactly one match: process it.
     match_type, match, name = matches[0]
 
     if match_type == 'set_config':
         if name is UNKNOWN:
-            return UNKNOWN
+            return UNKNOWN, 'session'
         if match.group('local').lower() not in ('true', 't', "'t'", "'true'"):
-            return UNKNOWN
-        return _resolve(match.group('value'), sql, match.start('value'), params)
+            return UNKNOWN, 'session'
+        return (_resolve(match.group('value'), sql,
+                         match.start('value'), params), 'local')
     elif match_type == 'set':
-        # Check locality: non-LOCAL SET is unsafe and fails closed.
         if (match.group('scope') or '').upper() != 'LOCAL':
-            return UNKNOWN
-        return _resolve(match.group('value'), sql, match.start('value'), params)
+            if match.group('value').upper() == 'DEFAULT':
+                # `SET <guc> = DEFAULT` is `RESET <guc>` spelled differently.
+                return None, 'reset'
+            return UNKNOWN, 'session'
+        return (_resolve(match.group('value'), sql,
+                         match.start('value'), params), 'local')
     else:  # reset
-        return None
+        return None, 'reset'
 
 
 def _iter_params(params):

@@ -129,6 +129,47 @@ class ParseTenantStatementTestCase(SimpleTestCase):
             self.parse("SET LOCAL app.tenant_id = '42'; RESET app.tenant_id"),
             UNKNOWN)
 
+    def test_quoted_and_commented_out_constructs_are_ignored(self):
+        for sql in (
+                "INSERT INTO log (msg) VALUES "
+                "('SET LOCAL app.tenant_id = ''9''')",
+                "SELECT 1 /* SET LOCAL app.tenant_id = '9' */",
+                "SELECT * FROM t WHERE note = 'reset app.tenant_id'",
+                "SELECT 1 -- SET LOCAL app.tenant_id = '9'",
+                'SELECT $$ RESET app.tenant_id $$',
+                "SELECT $tag$ SET app.tenant_id = '9' $tag$",
+                r"SELECT E'\' SET LOCAL app.tenant_id = ''9'''",
+                'SELECT * FROM "SET LOCAL app.tenant_id = 1"',
+                # Block comments nest in PostgreSQL: the first `*/` closes
+                # only the inner one.
+                '/* outer /* RESET app.tenant_id */ still open */ SELECT 1',
+                # An unterminated literal protects the rest of the statement.
+                "SELECT * FROM t WHERE note = 'oops; "
+                "SET LOCAL app.tenant_id = 9",
+        ):
+            self.assertIs(self.parse(sql), NOT_A_SET, sql)
+
+    def test_a_real_set_local_survives_a_decoy(self):
+        self.assertEqual(
+            self.parse("SET LOCAL app.tenant_id = '9' -- app.tenant_id again"),
+            '9')
+        self.assertEqual(
+            self.parse("/* app.tenant_id */ SET LOCAL app.tenant_id = '9'"),
+            '9')
+        self.assertEqual(
+            self.parse("SET LOCAL app.tenant_id = '9'; INSERT INTO log (msg) "
+                       "VALUES ('RESET app.tenant_id')"),
+            '9')
+
+    def test_placeholder_inside_a_literal_still_counts(self):
+        # psycopg counts a `%s` inside a literal as a placeholder too - a
+        # literal percent must be written `%%` - so the tenant is the second
+        # parameter here, not the first.
+        self.assertEqual(
+            self.parse("INSERT INTO log (msg) VALUES ('a %s b'); "
+                       'SET LOCAL app.tenant_id = %s', ['msg', '9']),
+            '9')
+
     def test_unrelated_trailing_statement_ignored(self):
         # One SET LOCAL for the GUC plus an unrelated statement.
         # The guard does not fire; we return the value.
