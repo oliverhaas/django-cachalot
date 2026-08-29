@@ -80,6 +80,11 @@ The tenant must be set with ``SET LOCAL`` or ``set_config(..., true)`` inside a
 transaction, through Django's cursor. One issued outside a transaction changes
 nothing, because PostgreSQL discards it too.
 
+Give it a value cachalot can read: a literal, or a positional ``%s``
+parameter. A named parameter (``%(tenant)s``) is not one, because cachalot
+cannot map it back to the value that was sent, so a transaction whose tenant
+arrives that way is not cached.
+
 Cachalot fails closed when it cannot determine the tenant: queries stop being
 cached and writes invalidate every tenant. Inside a transaction that happens on
 a statement cachalot cannot parse, or one that raised, and it lasts only until
@@ -92,9 +97,10 @@ A connection-scoped ``SET app.tenant_id = ...`` -- from a
 tells cachalot when it changes again. Cachalot therefore distrusts that
 connection from the statement on, and caches nothing on it except inside a
 transaction where a ``SET LOCAL`` masks the session value. Only
-``RESET app.tenant_id`` restores trust, and a reconnect is invisible to
-cachalot, so the distrust lasts as long as the connection object. Set the
-tenant per transaction with ``SET LOCAL`` instead.
+``RESET app.tenant_id`` outside a transaction restores trust: inside one a
+rollback could undo it without telling cachalot. A reconnect is invisible
+too, so the distrust otherwise lasts as long as the connection object. Set
+the tenant per transaction with ``SET LOCAL`` instead.
 
 Invalidating by hand
 ....................

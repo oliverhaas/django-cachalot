@@ -122,11 +122,9 @@ class ParseTenantStatementTestCase(SimpleTestCase):
         # A bare identifier may be a function call, so we do not evaluate it.
         self.assertIs(self.parse('SET LOCAL app.tenant_id = current_user'),
                       UNKNOWN)
-        # the locality flag itself is a placeholder
         self.assertIs(
             self.parse("SELECT set_config('app.tenant_id', '42', %s)", [True]),
             UNKNOWN)
-        # a placeholder with no matching parameter
         self.assertIs(self.parse('SET LOCAL app.tenant_id = %s', []), UNKNOWN)
 
     def test_disabled_feature_parses_nothing(self):
@@ -182,6 +180,32 @@ class ParseTenantStatementTestCase(SimpleTestCase):
             self.parse("INSERT INTO log (msg) VALUES ('a %s b'); "
                        'SET LOCAL app.tenant_id = %s', ['msg', '9']),
             '9')
+
+    def test_escaped_percent_is_not_a_placeholder(self):
+        self.assertEqual(
+            self.parse("INSERT INTO log (msg) VALUES ('%%s'); "
+                       'SET LOCAL app.tenant_id = %s', ['9', 'junk']),
+            '9')
+
+    def test_pyformat_constructs_are_unresolvable_not_absent(self):
+        for sql, params in (
+                ('SET LOCAL app.tenant_id = %(t)s', {'t': '42'}),
+                ("SELECT set_config('app.tenant_id', %(t)s, true)",
+                 {'t': '42'}),
+                ('SELECT set_config(%(n)s, %(t)s, true)',
+                 {'n': 'app.tenant_id', 't': '42'}),
+        ):
+            self.assertIs(self.parse(sql, params), UNKNOWN, sql)
+
+    def test_pyformat_elsewhere_does_not_make_a_construct(self):
+        self.assertIs(
+            self.parse('SELECT 1 /* app.tenant_id */ WHERE x = %(v)s',
+                       {'v': 1}),
+            NOT_A_SET)
+
+    def test_dollar_inside_an_identifier_opens_nothing(self):
+        self.assertEqual(
+            self.parse("SELECT a$b$c; SET LOCAL app.tenant_id = '9'"), '9')
 
     def test_unrelated_trailing_statement_ignored(self):
         self.assertEqual(self.parse("SET LOCAL app.tenant_id = '7'; SELECT 1"),
@@ -272,6 +296,21 @@ class ConnectionTenantTestCase(TenantStateMixin, TransactionTestCase):
     def test_reset_trusts_the_connection_again(self):
         observe_statement(connection, "SET app.tenant_id = '42'")
         observe_statement(connection, 'RESET app.tenant_id')
+        self.assertIsNone(get_tenant(connection))
+
+    def test_reset_inside_a_transaction_keeps_the_connection_distrusted(self):
+        # A rollback would put the session value back without telling us.
+        observe_statement(connection, "SET app.tenant_id = '42'")
+        with transaction.atomic():
+            observe_statement(connection, 'RESET app.tenant_id')
+            self.assertIs(get_tenant(connection), UNKNOWN)
+        self.assertIs(get_tenant(connection), UNKNOWN)
+
+    def test_local_pyformat_set_does_not_distrust_the_connection(self):
+        with transaction.atomic():
+            observe_statement(connection, 'SET LOCAL app.tenant_id = %(t)s',
+                              {'t': '42'})
+            self.assertIs(get_tenant(connection), UNKNOWN)
         self.assertIsNone(get_tenant(connection))
 
     def test_failed_reset_leaves_the_connection_distrusted(self):
@@ -622,7 +661,6 @@ class TenantInvalidationTestCase(TenantStateMixin, TestUtilsMixin,
     def test_unknown_tenant_invalidates_globally(self):
         before_other = self.last('b')
         with transaction.atomic():
-            # A non-LOCAL SET is unparsable, so the tenant becomes UNKNOWN.
             observe_statement(connection, "SET app.tenant_id = 'a'")
             Test.objects.create(name='x')
         self.assertGreater(self.last('b'), before_other)

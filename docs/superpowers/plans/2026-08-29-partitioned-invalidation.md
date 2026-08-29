@@ -281,7 +281,7 @@ class ParseTenantStatementTestCase(SimpleTestCase):
             UNKNOWN)
 
     def test_unresolvable_values_are_unknown(self):
-        # pyformat placeholders
+        # a named parameter, which we cannot map back to its value
         self.assertIs(
             self.parse('SET LOCAL app.tenant_id = %(t)s', {'t': '42'}), UNKNOWN)
         # a computed value we will not evaluate
@@ -317,6 +317,7 @@ Create `cachalot/tenancy.py`:
 
 ```python
 import re
+from bisect import bisect_right
 from functools import lru_cache
 
 from .settings import cachalot_settings
@@ -346,6 +347,11 @@ def tenancy_enabled():
     return cachalot_settings.CACHALOT_TENANT_SETTING is not None
 
 
+# A pyformat placeholder is matched so that a construct spelled with one is
+# read as a value we cannot resolve rather than as no construct at all.
+_PYFORMAT = r'%\([^)]*\)s'
+
+
 @lru_cache(maxsize=8)
 def _compile(guc):
     name = re.escape(guc)
@@ -353,16 +359,18 @@ def _compile(guc):
         # SET [LOCAL|SESSION] <guc> {=|TO} <value>
         re.compile(
             r'\bSET\s+(?:(?P<scope>LOCAL|SESSION)\s+)?"?%s"?\s*'
-            r'(?:=|\bTO\b)\s*(?P<value>\'(?:[^\']|\'\')*\'|[^\s;,)]+)' % name,
+            r'(?:=|\bTO\b)\s*(?P<value>\'(?:[^\']|\'\')*\'|%s|[^\s;,)]+)'
+            % (name, _PYFORMAT),
             re.IGNORECASE),
         # RESET <guc>
         re.compile(r'\bRESET\s+"?%s"?' % name, re.IGNORECASE),
         # set_config(<name>, <value>, <is_local>)
         re.compile(
             r'\bset_config\s*\(\s*'
-            r"(?P<name>'(?:[^']|'')*'|%s)\s*,\s*"
-            r"(?P<value>'(?:[^']|'')*'|%s|NULL)\s*,\s*"
-            r'(?P<local>[^\s,)]+)\s*\)',
+            r"(?P<name>'(?:[^']|'')*'|%%s|%(pyformat)s)\s*,\s*"
+            r"(?P<value>'(?:[^']|'')*'|%%s|%(pyformat)s|NULL)\s*,\s*"
+            r'(?P<local>%(pyformat)s|[^\s,)]+)\s*\)'
+            % {'pyformat': _PYFORMAT},
             re.IGNORECASE),
     )
 
@@ -410,7 +418,7 @@ def _quoted_spans(sql):
                     j += 1
             spans.append((i, min(j, length)))
             i = min(j, length)
-        elif char == '$':
+        elif char == '$' and (i == 0 or sql[i - 1] not in _IDENT_CHARS):
             match = _DOLLAR_TAG_RE.match(sql, i)
             if match is None:
                 i += 1
@@ -448,8 +456,10 @@ def _quoted_spans(sql):
     return spans
 
 
-def _is_quoted(spans, pos):
-    return any(start <= pos < end for start, end in spans)
+def _is_quoted(spans, starts, pos):
+    """Whether ``pos`` falls in one of the non-overlapping, ordered ``spans``."""
+    index = bisect_right(starts, pos) - 1
+    return index >= 0 and pos < spans[index][1]
 
 
 def _resolve(token, sql, pos, params):
@@ -457,10 +467,19 @@ def _resolve(token, sql, pos, params):
     if token == '%s':
         if params is None:
             return UNKNOWN
+        # psycopg counts a `%s` inside a literal as a placeholder too, but
+        # `%%s` is an escaped percent sign rather than one.
+        index = i = 0
+        while i < pos:
+            if sql[i] != '%':
+                i += 1
+            elif sql.startswith('%%', i):
+                i += 2
+            else:
+                index += sql.startswith('%s', i)
+                i += 1
         try:
-            # psycopg counts a `%s` inside a literal as a placeholder
-            # too, so counting them in the raw SQL is the right index.
-            value = params[sql.count('%s', 0, pos)]
+            value = params[index]
         except (IndexError, KeyError, TypeError):
             return UNKNOWN
         return None if value is None else str(value)
@@ -509,28 +528,26 @@ def _parse_tenant_statement(sql, params=None):
 
     # Constructs sitting in a literal or comment only look like one.
     spans = _quoted_spans(sql)
+    starts = [span[0] for span in spans]
     matches = []
 
     for match in set_config_re.finditer(sql):
-        if _is_quoted(spans, match.start()):
+        if _is_quoted(spans, starts, match.start()):
             continue
         name = _resolve(match.group('name'), sql, match.start('name'), params)
         if name is UNKNOWN or name == guc:
             matches.append(('set_config', match, name))
 
     for match in set_re.finditer(sql):
-        if not _is_quoted(spans, match.start()):
+        if not _is_quoted(spans, starts, match.start()):
             matches.append(('set', match, None))
 
     for match in reset_re.finditer(sql):
-        if not _is_quoted(spans, match.start()):
+        if not _is_quoted(spans, starts, match.start()):
             matches.append(('reset', match, None))
 
     if not matches:
         return NOT_A_SET, 'none'
-    if '%(' in sql:
-        # pyformat placeholders: we cannot map positions to parameters.
-        return UNKNOWN, 'session'
     if len(matches) > 1:
         # We cannot tell which one wins, so we trust none of them.
         return UNKNOWN, 'session'
@@ -538,10 +555,11 @@ def _parse_tenant_statement(sql, params=None):
     match_type, match, name = matches[0]
 
     if match_type == 'set_config':
+        local = match.group('local').lower() in ('true', 't', "'t'", "'true'")
+        if not local:
+            return UNKNOWN, 'session'
         if name is UNKNOWN:
-            return UNKNOWN, 'session'
-        if match.group('local').lower() not in ('true', 't', "'t'", "'true'"):
-            return UNKNOWN, 'session'
+            return UNKNOWN, 'local'
         return (_resolve(match.group('value'), sql,
                          match.start('value'), params), 'local')
     elif match_type == 'set':
@@ -749,7 +767,10 @@ def observe_statement(connection, sql, params=None, failed=False):
         # changes again, only a RESET tells us where it ended up, and a
         # reconnect is invisible, so the flag lives as long as the wrapper.
         connection._cachalot_session_tenant_dirty = True
-    elif scope == 'reset' and not failed:
+    elif (scope == 'reset' and not failed
+            and not connection.in_atomic_block):
+        # Only out here is a RESET final.  Inside a transaction a rollback
+        # would put the session value back without telling us.
         connection._cachalot_session_tenant_dirty = False
     if tenant is NOT_A_SET or not connection.in_atomic_block:
         # A ``SET LOCAL`` outside a transaction is discarded by PostgreSQL.
@@ -790,10 +811,8 @@ def pop_tenant(connection, committed=True):
     """
     stack = getattr(connection, '_cachalot_tenant_stack', None)
     if stack is None:
-        # Never pushed on this connection, so there is nothing to restore and
-        # nothing to write.  Deliberately not gated on ``tenancy_enabled()``:
-        # a block entered while the feature was on must still pop if the
-        # setting is toggled off before it exits.
+        # Not gated on ``tenancy_enabled()``: a block entered while the
+        # feature was on must still pop if it is switched off before exit.
         return
     remembered = stack.pop() if stack else None
     if not stack:
