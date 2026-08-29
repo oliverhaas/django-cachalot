@@ -203,14 +203,15 @@ class ConnectionTenantTestCase(TransactionTestCase):
 
     def test_nested_push_does_not_clear(self):
         with transaction.atomic():
+            # Outermost push clears the live value
+            push_tenant(connection)
+            # Set tenant inside the outer block
             observe_statement(connection, "SET LOCAL app.tenant_id = '7'")
+            # Guard: prove the setup worked
+            self.assertEqual(get_tenant(connection), '7')
+            # Nested push must not clear the live value
             push_tenant(connection)
-            # After outermost push, live value was cleared
-            self.assertIsNone(get_tenant(connection))
-            # But the stack captured the value
-            push_tenant(connection)
-            # Nested push does not clear the live value
-            self.assertIsNone(get_tenant(connection))
+            self.assertEqual(get_tenant(connection), '7')
 
 
 class TablePredicatesTestCase(SimpleTestCase):
@@ -232,7 +233,9 @@ class TablePredicatesTestCase(SimpleTestCase):
                                          'cachalot_test'}))
         self.assertFalse(are_all_shared(set()))
 
+    @override_settings(CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
     def test_are_all_shared_when_feature_disabled(self):
         # With the feature off, are_all_shared should return True to behave
-        # like master (no tenant scoping), even if the table is not shared.
+        # like master (no tenant scoping), even if the table is not in the
+        # shared tables list.
         self.assertTrue(are_all_shared({'cachalot_test'}))
