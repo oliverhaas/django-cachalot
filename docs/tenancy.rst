@@ -77,15 +77,24 @@ bypass its policies, and it does nothing for a superuser or a ``BYPASSRLS``
 role.
 
 The tenant must be set with ``SET LOCAL`` or ``set_config(..., true)`` inside a
-transaction, through Django's cursor. Cachalot ignores a tenant set outside a
-transaction, because PostgreSQL discards it too.
+transaction, through Django's cursor. One issued outside a transaction changes
+nothing, because PostgreSQL discards it too.
 
-Cachalot fails closed when it cannot determine the tenant, for example on a
-connection-scoped ``SET``, a statement it cannot parse, or a statement that
-raised: queries stop being cached and writes invalidate every tenant. That
-state lasts only until a later statement in the same transaction sets the
-tenant to a value cachalot can resolve, not unconditionally to the end of
-the transaction.
+Cachalot fails closed when it cannot determine the tenant: queries stop being
+cached and writes invalidate every tenant. Inside a transaction that happens on
+a statement cachalot cannot parse, or one that raised, and it lasts only until
+a later statement in the same transaction sets the tenant to a value cachalot
+can resolve.
+
+A connection-scoped ``SET app.tenant_id = ...`` -- from a
+``connection_created`` receiver, from middleware, or from the engine's
+``OPTIONS`` -- is a stronger case: it outlives every transaction, and nothing
+tells cachalot when it changes again. Cachalot therefore distrusts that
+connection from the statement on, and caches nothing on it except inside a
+transaction where a ``SET LOCAL`` masks the session value. Only
+``RESET app.tenant_id`` restores trust, and a reconnect is invisible to
+cachalot, so the distrust lasts as long as the connection object. Set the
+tenant per transaction with ``SET LOCAL`` instead.
 
 Invalidating by hand
 ....................

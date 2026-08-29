@@ -21,6 +21,22 @@ from .models import Test, TestParent
 from .test_utils import FilteredTransactionTestCase, TestUtilsMixin
 
 
+class TenantStateMixin:
+    """
+    Clear the tenant bookkeeping a test leaves behind on the connection.
+
+    ``_cachalot_session_tenant_dirty`` is sticky by design, so a test that
+    makes a session-scoped write would otherwise stop every test after it on
+    this connection from caching anything.
+    """
+
+    def tearDown(self):
+        super().tearDown()
+        connection._cachalot_tenant = None
+        connection._cachalot_tenant_stack = []
+        connection._cachalot_session_tenant_dirty = False
+
+
 class TenancySettingsTestCase(TransactionTestCase):
     def test_defaults_are_inert(self):
         self.assertIsNone(cachalot_settings.CACHALOT_TENANT_SETTING)
@@ -190,11 +206,7 @@ class TenancyEnabledTestCase(SimpleTestCase):
 
 
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
-class ConnectionTenantTestCase(TransactionTestCase):
-    def tearDown(self):
-        connection._cachalot_tenant = None
-        connection._cachalot_tenant_stack = []
-
+class ConnectionTenantTestCase(TenantStateMixin, TransactionTestCase):
     def test_no_tenant_outside_a_transaction(self):
         observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
         self.assertIsNone(get_tenant(connection))
@@ -247,6 +259,30 @@ class ConnectionTenantTestCase(TransactionTestCase):
             observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
             pop_tenant(connection)
             self.assertIsNone(get_tenant(connection))
+
+    def test_session_scoped_set_distrusts_the_connection(self):
+        observe_statement(connection, "SET app.tenant_id = '42'")
+        self.assertIs(get_tenant(connection), UNKNOWN)
+        with transaction.atomic():
+            self.assertIs(get_tenant(connection), UNKNOWN)
+
+    def test_set_local_masks_a_distrusted_session_value(self):
+        observe_statement(connection, "SET app.tenant_id = '42'")
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
+            self.assertEqual(get_tenant(connection), '43')
+        # The session value is unmasked again once the transaction is over.
+        self.assertIs(get_tenant(connection), UNKNOWN)
+
+    def test_reset_trusts_the_connection_again(self):
+        observe_statement(connection, "SET app.tenant_id = '42'")
+        observe_statement(connection, 'RESET app.tenant_id')
+        self.assertIsNone(get_tenant(connection))
+
+    def test_failed_reset_leaves_the_connection_distrusted(self):
+        observe_statement(connection, "SET app.tenant_id = '42'")
+        observe_statement(connection, 'RESET app.tenant_id', failed=True)
+        self.assertIs(get_tenant(connection), UNKNOWN)
 
     def test_disabled_feature_records_nothing(self):
         with override_settings(CACHALOT_TENANT_SETTING=None):
@@ -395,15 +431,14 @@ class TableCacheKeysTestCase(SimpleTestCase):
 
 
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
-class TenantPlumbingTestCase(TransactionTestCase):
+class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
     def tearDown(self):
         # A non-empty stack here means some push was never matched by a pop.
         # Assert it before resetting, so an imbalance fails a test instead of
         # passing silently.
         stack = getattr(connection, '_cachalot_tenant_stack', None)
         self.assertFalse(stack, 'tenant stack leaked: %r' % (stack,))
-        connection._cachalot_tenant = None
-        connection._cachalot_tenant_stack = []
+        super().tearDown()
 
     def set_tenant(self, value):
         """Issue the statement the app would issue, through a real cursor.
@@ -562,7 +597,8 @@ def as_tenant(value):
 
 
 @override_settings(**TENANCY)
-class TenantInvalidationTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+class TenantInvalidationTestCase(TenantStateMixin, TestUtilsMixin,
+                                 FilteredTransactionTestCase):
     def last(self, tenant=None):
         return get_last_invalidation(PARTITIONED, tenant=tenant)
 
@@ -674,7 +710,8 @@ class TenantInvalidationTestCase(TestUtilsMixin, FilteredTransactionTestCase):
 
 
 @override_settings(**TENANCY)
-class PartitionedReadTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+class PartitionedReadTestCase(TenantStateMixin, TestUtilsMixin,
+                              FilteredTransactionTestCase):
     def read(self, tenant=None):
         if tenant is None:
             return list(Test.objects.all())
@@ -755,7 +792,8 @@ class PartitionedReadTestCase(TestUtilsMixin, FilteredTransactionTestCase):
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
                    CACHALOT_PARTITIONED_TABLES=(PARTITIONED,),
                    CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
-class SharedTableTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+class SharedTableTestCase(TenantStateMixin, TestUtilsMixin,
+                          FilteredTransactionTestCase):
     def test_shared_table_queries_are_reused_across_tenants(self):
         with as_tenant('a'):
             with self.assertNumQueries(1):
@@ -821,7 +859,8 @@ class SharedTableTestCase(TestUtilsMixin, FilteredTransactionTestCase):
 
 @skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
 @override_settings(**TENANCY)
-class PostgresTenancyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
+class PostgresTenancyTestCase(TenantStateMixin, TestUtilsMixin,
+                              FilteredTransactionTestCase):
     """
     Drives the feature the way a real deployment does: the tenant arrives
     only as a PostgreSQL session variable, and an RLS policy - not the ORM -
@@ -929,6 +968,23 @@ class PostgresTenancyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
                     self.set_tenant(cursor, 'b')
             self.assertEqual([t.name for t in Test.objects.all()], ['row-b'])
         self.assertEqual(self.names('a'), ['row-a'])
+
+    def test_session_scoped_tenant_is_never_served_from_cache(self):
+        # A tenant set on the session, not with SET LOCAL, is fully in force
+        # for RLS but invisible to cachalot's bookkeeping, so nothing read
+        # under it may be cached.
+        self.create('a', 'row-a')
+        self.create('b', 'row-b')
+        with connection.cursor() as cursor:
+            cursor.execute("SET app.tenant_id = 'a'")
+        try:
+            self.assertEqual([t.name for t in Test.objects.all()], ['row-a'])
+            with connection.cursor() as cursor:
+                cursor.execute("SET app.tenant_id = 'b'")
+            self.assertEqual([t.name for t in Test.objects.all()], ['row-b'])
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute('RESET app.tenant_id')
 
     def test_write_in_one_tenant_spares_the_other(self):
         self.create('a', 'row-a')

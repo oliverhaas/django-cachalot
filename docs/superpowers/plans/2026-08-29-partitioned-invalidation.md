@@ -216,7 +216,7 @@ A pure function, no Django state, testable on any backend. It answers one questi
 - Produces:
   - `NOT_A_SET`, `UNKNOWN` — module-level sentinels, importable from `cachalot.tenancy`.
   - `tenancy_enabled() -> bool`
-  - `parse_tenant_statement(sql, params) -> NOT_A_SET | UNKNOWN | str | None` — `NOT_A_SET` means the statement did not touch the GUC; `None` means the GUC was cleared; a `str` is the new tenant; `UNKNOWN` means it was touched in a way we refuse to interpret.
+  - `parse_tenant_statement(sql, params) -> NOT_A_SET | UNKNOWN | str | None` (and the private `_parse_tenant_statement`, which also reports the scope of the change: `'none'`, `'local'`, `'reset'` or `'session'`) — `NOT_A_SET` means the statement did not touch the GUC; `None` means the GUC was cleared; a `str` is the new tenant; `UNKNOWN` means it was touched in a way we refuse to interpret.
 
 - [ ] **Step 1: Write the failing parser tests**
 
@@ -735,13 +735,23 @@ def get_tenant(connection):
     """
     The tenant currently in force on ``connection``.
 
-    Always ``None`` outside a transaction: a ``SET LOCAL`` issued in autocommit
-    is discarded by PostgreSQL, and this guard also stops a tenant value from
-    surviving on a pooled connection past the transaction that set it.
+    A ``SET LOCAL`` only exists inside a transaction, so outside one the
+    answer is ``None`` - which also stops a value from surviving on a pooled
+    connection past the transaction that set it.  The exception is a
+    connection whose setting was touched outside ``SET LOCAL`` semantics:
+    that value outlives the statement that made it and we cannot see it, so
+    the connection is distrusted until a ``SET LOCAL`` overrides it.
     """
-    if not tenancy_enabled() or not connection.in_atomic_block:
+    if not tenancy_enabled():
         return None
-    return getattr(connection, '_cachalot_tenant', None)
+    dirty = getattr(connection, '_cachalot_session_tenant_dirty', False)
+    if not connection.in_atomic_block:
+        return UNKNOWN if dirty else None
+    tenant = getattr(connection, '_cachalot_tenant', None)
+    if tenant is None and dirty:
+        # No ``SET LOCAL`` is masking the session value, so it shows through.
+        return UNKNOWN
+    return tenant
 
 
 def observe_statement(connection, sql, params=None, failed=False):
@@ -751,10 +761,20 @@ def observe_statement(connection, sql, params=None, failed=False):
     ``failed`` marks a statement that raised: it never took effect in the
     database, so its value must not be trusted.
     """
-    if not tenancy_enabled() or not connection.in_atomic_block:
+    if not tenancy_enabled():
         return
-    tenant = parse_tenant_statement(sql, params)
-    if tenant is NOT_A_SET:
+    tenant, scope = _parse_tenant_statement(sql, params)
+    if scope == 'session':
+        # Session-scoped, or something we could not read.  Either way it can
+        # outlive this statement where we cannot follow it.  Sticky by
+        # design: only an explicit RESET tells us the setting is back to a
+        # state we know, and cachalot cannot see a reconnect, so the flag
+        # lives as long as the connection wrapper.
+        connection._cachalot_session_tenant_dirty = True
+    elif scope == 'reset' and not failed:
+        connection._cachalot_session_tenant_dirty = False
+    if tenant is NOT_A_SET or not connection.in_atomic_block:
+        # A ``SET LOCAL`` outside a transaction is discarded by PostgreSQL.
         return
     connection._cachalot_tenant = UNKNOWN if failed else tenant
 
@@ -1912,13 +1932,24 @@ another tenant's rows — a ``BYPASSRLS`` role, a table listed in
 cross-tenant reads.
 
 The tenant must be set with ``SET LOCAL`` or ``set_config(…, true)`` inside a
-transaction, through Django's cursor. Cachalot ignores a tenant set outside a
-transaction, because PostgreSQL discards it too.
+transaction, through Django's cursor. One issued outside a transaction changes
+nothing, because PostgreSQL discards it too.
 
-When cachalot cannot determine the tenant — a connection-scoped ``SET``, a
-statement it cannot parse, a statement that raised — it fails closed: queries
-on that connection are not cached at all for the rest of the transaction, and
-writes invalidate every tenant.
+Cachalot fails closed when it cannot determine the tenant: queries stop being
+cached and writes invalidate every tenant. Inside a transaction that happens on
+a statement cachalot cannot parse, or one that raised, and it lasts only until
+a later statement in the same transaction sets the tenant to a value cachalot
+can resolve.
+
+A connection-scoped ``SET app.tenant_id = …`` — from a
+``connection_created`` receiver, from middleware, or from the engine's
+``OPTIONS`` — is a stronger case: it outlives every transaction, and nothing
+tells cachalot when it changes again. Cachalot therefore distrusts that
+connection from the statement on, and caches nothing on it except inside a
+transaction where a ``SET LOCAL`` masks the session value. Only
+``RESET app.tenant_id`` restores trust, and a reconnect is invisible to
+cachalot, so the distrust lasts as long as the connection object. Set the
+tenant per transaction with ``SET LOCAL`` instead.
 
 Invalidating by hand
 ....................
