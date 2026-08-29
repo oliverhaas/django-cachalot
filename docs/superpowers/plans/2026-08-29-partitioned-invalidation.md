@@ -602,7 +602,7 @@ git commit -m "feat: Add tenant GUC statement parser"
 - Produces:
   - `observe_statement(connection, sql, params=None, failed=False) -> None` — the single entry point the cursor patch calls.
   - `get_tenant(connection) -> None | str | UNKNOWN`
-  - `push_tenant(connection) -> None` / `pop_tenant(connection) -> None`
+  - `push_tenant(connection) -> None` / `pop_tenant(connection, committed=True) -> None`
   - `is_partitioned(table) -> bool`
   - `are_all_shared(tables) -> bool`
 
@@ -654,13 +654,22 @@ class ConnectionTenantTestCase(TransactionTestCase):
             observe_statement(connection, "SET app.tenant_id = '43'")
             self.assertIs(get_tenant(connection), UNKNOWN)
 
-    def test_nested_atomic_restores_outer_tenant(self):
+    def test_committed_nested_atomic_keeps_its_tenant(self):
         with transaction.atomic():
             observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
             push_tenant(connection)
             observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
             self.assertEqual(get_tenant(connection), '43')
             pop_tenant(connection)
+            # PostgreSQL keeps a SET LOCAL made inside a released savepoint.
+            self.assertEqual(get_tenant(connection), '43')
+
+    def test_rolled_back_nested_atomic_restores_its_outer_tenant(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            push_tenant(connection)
+            observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
+            pop_tenant(connection, committed=False)
             self.assertEqual(get_tenant(connection), '42')
 
     def test_pop_without_push_clears(self):
@@ -769,15 +778,17 @@ def push_tenant(connection):
         connection._cachalot_tenant = None
 
 
-def pop_tenant(connection):
+def pop_tenant(connection, committed=True):
     """
-    Restore the tenant remembered by the matching ``push_tenant``.
+    Undo the tenant bookkeeping of the matching ``push_tenant``.
 
-    On the outermost block this restores ``None``, which is what ending the
-    transaction does to a ``SET LOCAL``. On a committed *nested* block this is
-    deliberately conservative: PostgreSQL would keep a ``SET LOCAL`` issued
-    inside a released savepoint, we revert it to the tenant that was in force
-    when the nested block was entered.
+    The outermost block always lands on ``None``: ending a transaction
+    discards every ``SET LOCAL`` made inside it, committed or not.
+
+    A *nested* block follows the database.  PostgreSQL keeps a ``SET LOCAL``
+    issued inside a savepoint that is released, so a committed nested block
+    leaves its tenant in force in the outer block.  Only a rollback to the
+    savepoint undoes it, and only then do we restore what the block inherited.
     """
     stack = getattr(connection, '_cachalot_tenant_stack', None)
     if stack is None:
@@ -786,7 +797,11 @@ def pop_tenant(connection):
         # a block entered while the feature was on must still pop if the
         # setting is toggled off before it exits.
         return
-    connection._cachalot_tenant = stack.pop() if stack else None
+    remembered = stack.pop() if stack else None
+    if not stack:
+        connection._cachalot_tenant = None
+    elif not committed:
+        connection._cachalot_tenant = remembered
 
 
 def is_partitioned(table):
@@ -1042,13 +1057,14 @@ class TenantPlumbingTestCase(TransactionTestCase):
         except Exception:
             pass
 
-    def test_real_nested_atomic_restores_outer_tenant(self):
+    def test_real_committed_nested_atomic_keeps_the_inner_tenant(self):
         with transaction.atomic():
             observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
             with transaction.atomic():
                 observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
                 self.assertEqual(get_tenant(connection), '43')
-            self.assertEqual(get_tenant(connection), '42')
+            # Releasing the savepoint does not undo the inner SET LOCAL.
+            self.assertEqual(get_tenant(connection), '43')
         self.assertIsNone(get_tenant(connection))
 
     def test_rolled_back_atomic_restores_outer_tenant(self):
@@ -1183,9 +1199,9 @@ In `_patch_atomic()`, change the two inner functions:
             try:
                 original(self, exc_type, exc_value, traceback)
             finally:
-                cachalot_caches.exit_atomic(
-                    self.using, exc_type is None and not needs_rollback)
-                pop_tenant(connection)
+                committed = exc_type is None and not needs_rollback
+                cachalot_caches.exit_atomic(self.using, committed)
+                pop_tenant(connection, committed)
 
         return inner
 ```

@@ -223,9 +223,9 @@ def _patch_atomic():
             try:
                 original(self, exc_type, exc_value, traceback)
             finally:
-                cachalot_caches.exit_atomic(
-                    self.using, exc_type is None and not needs_rollback)
-                pop_tenant(connection)
+                committed = exc_type is None and not needs_rollback
+                cachalot_caches.exit_atomic(self.using, committed)
+                pop_tenant(connection, committed)
 
         return inner
 

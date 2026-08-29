@@ -224,13 +224,22 @@ class ConnectionTenantTestCase(TransactionTestCase):
             observe_statement(connection, "SET app.tenant_id = '43'")
             self.assertIs(get_tenant(connection), UNKNOWN)
 
-    def test_nested_atomic_restores_outer_tenant(self):
+    def test_committed_nested_atomic_keeps_its_tenant(self):
         with transaction.atomic():
             observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
             push_tenant(connection)
             observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
             self.assertEqual(get_tenant(connection), '43')
             pop_tenant(connection)
+            # PostgreSQL keeps a SET LOCAL made inside a released savepoint.
+            self.assertEqual(get_tenant(connection), '43')
+
+    def test_rolled_back_nested_atomic_restores_its_outer_tenant(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            push_tenant(connection)
+            observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
+            pop_tenant(connection, committed=False)
             self.assertEqual(get_tenant(connection), '42')
 
     def test_pop_without_push_clears(self):
@@ -408,13 +417,14 @@ class TenantPlumbingTestCase(TransactionTestCase):
         except Exception:
             pass
 
-    def test_real_nested_atomic_restores_outer_tenant(self):
+    def test_real_committed_nested_atomic_keeps_the_inner_tenant(self):
         with transaction.atomic():
             observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
             with transaction.atomic():
                 observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
                 self.assertEqual(get_tenant(connection), '43')
-            self.assertEqual(get_tenant(connection), '42')
+            # Releasing the savepoint does not undo the inner SET LOCAL.
+            self.assertEqual(get_tenant(connection), '43')
         self.assertIsNone(get_tenant(connection))
 
     def test_rolled_back_atomic_restores_outer_tenant(self):
@@ -850,6 +860,12 @@ class PostgresTenancyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         cursor.execute('SELECT set_config(%s, %s, true)',
                        ['app.tenant_id', value])
 
+    def db_tenant(self):
+        """The tenant PostgreSQL itself is running under, right now."""
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_setting('app.tenant_id', true)")
+            return cursor.fetchone()[0]
+
     @contextmanager
     def tenant_transaction(self, tenant):
         """Open a transaction with ``tenant`` set, before any counting starts.
@@ -882,6 +898,37 @@ class PostgresTenancyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         # Served from cache this time, and still not each other's rows.
         self.assertEqual(self.names('a'), ['row-a'])
         self.assertEqual(self.names('b'), ['row-b'])
+
+    def test_committed_nested_atomic_agrees_with_the_database(self):
+        with self.tenant_transaction('a'):
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    self.set_tenant(cursor, 'b')
+            self.assertEqual(self.db_tenant(), 'b')
+            self.assertEqual(get_tenant(connection), self.db_tenant())
+
+    def test_rolled_back_nested_atomic_agrees_with_the_database(self):
+        with self.tenant_transaction('a'):
+            with self.assertRaises(ValueError):
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        self.set_tenant(cursor, 'b')
+                    raise ValueError('rollback')
+            self.assertEqual(self.db_tenant(), 'a')
+            self.assertEqual(get_tenant(connection), self.db_tenant())
+
+    def test_committed_nested_atomic_does_not_leak_its_rows(self):
+        # The outer block runs under tenant b from the nested block on, so
+        # its read returns b's rows. Storing those under tenant a's key
+        # served them straight back to an honest tenant-a transaction.
+        self.create('a', 'row-a')
+        self.create('b', 'row-b')
+        with self.tenant_transaction('a'):
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    self.set_tenant(cursor, 'b')
+            self.assertEqual([t.name for t in Test.objects.all()], ['row-b'])
+        self.assertEqual(self.names('a'), ['row-a'])
 
     def test_write_in_one_tenant_spares_the_other(self):
         self.create('a', 'row-a')

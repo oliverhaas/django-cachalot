@@ -305,15 +305,17 @@ def push_tenant(connection):
         connection._cachalot_tenant = None
 
 
-def pop_tenant(connection):
+def pop_tenant(connection, committed=True):
     """
-    Restore the tenant remembered by the matching ``push_tenant``.
+    Undo the tenant bookkeeping of the matching ``push_tenant``.
 
-    On the outermost block this restores ``None``, which is what ending the
-    transaction does to a ``SET LOCAL``. On a committed *nested* block this is
-    deliberately conservative: PostgreSQL would keep a ``SET LOCAL`` issued
-    inside a released savepoint, we revert it to the tenant that was in force
-    when the nested block was entered.
+    The outermost block always lands on ``None``: ending a transaction
+    discards every ``SET LOCAL`` made inside it, committed or not.
+
+    A *nested* block follows the database.  PostgreSQL keeps a ``SET LOCAL``
+    issued inside a savepoint that is released, so a committed nested block
+    leaves its tenant in force in the outer block.  Only a rollback to the
+    savepoint undoes it, and only then do we restore what the block inherited.
     """
     stack = getattr(connection, '_cachalot_tenant_stack', None)
     if stack is None:
@@ -322,7 +324,11 @@ def pop_tenant(connection):
         # a block entered while the feature was on must still pop if the
         # setting is toggled off before it exits.
         return
-    connection._cachalot_tenant = stack.pop() if stack else None
+    remembered = stack.pop() if stack else None
+    if not stack:
+        connection._cachalot_tenant = None
+    elif not committed:
+        connection._cachalot_tenant = remembered
 
 
 def is_partitioned(table):
