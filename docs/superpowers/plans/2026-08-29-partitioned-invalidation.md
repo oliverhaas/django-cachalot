@@ -367,11 +367,9 @@ def _compile(guc):
     )
 
 
-#: The opening (or closing) delimiter of a dollar-quoted string, tag included.
 _DOLLAR_TAG_RE = re.compile(r'\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$')
 
-#: Characters that may precede the ``E`` of an ``E'...'`` string only if it is
-#: not simply the tail of an identifier or keyword (``LIKE'x'`` is not one).
+# An `E` only opens a string if it stands alone: `LIKE'x'` ends in one too.
 _IDENT_CHARS = frozenset(
     'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$')
 
@@ -454,18 +452,15 @@ def _is_quoted(spans, pos):
     return any(start <= pos < end for start, end in spans)
 
 
-def _param_index(sql, pos):
-    """Index into ``params`` of the ``%s`` placeholder starting at ``pos``."""
-    return sql.count('%s', 0, pos)
-
-
 def _resolve(token, sql, pos, params):
     """Turn a matched SQL token into a tenant value, ``None`` or ``UNKNOWN``."""
     if token == '%s':
         if params is None:
             return UNKNOWN
         try:
-            value = params[_param_index(sql, pos)]
+            # psycopg counts a `%s` inside a literal as a placeholder
+            # too, so counting them in the raw SQL is the right index.
+            value = params[sql.count('%s', 0, pos)]
         except (IndexError, KeyError, TypeError):
             return UNKNOWN
         return None if value is None else str(value)
@@ -491,20 +486,12 @@ def parse_tenant_statement(sql, params=None):
 
 def _parse_tenant_statement(sql, params=None):
     """
-    As ``parse_tenant_statement``, but also reporting *how* the setting was
-    touched, which decides how long the change outlives the statement:
-
-    ``'none'``
-        Nothing touched the setting; the value is ``NOT_A_SET``.
-    ``'local'``
-        ``SET LOCAL`` or ``set_config(..., true)``: the value dies with the
-        transaction, and we can follow it.
-    ``'reset'``
-        ``RESET``, or a session-scoped ``SET ... = DEFAULT``: session-scoped,
-        but its end state is exactly the ``None`` we model as "no tenant".
-    ``'session'``
-        Anything else that touches it.  The value outlives the statement
-        somewhere we cannot follow, so it is ``UNKNOWN``.
+    As ``parse_tenant_statement``, plus how long the change outlives the
+    statement: ``'none'`` (nothing touched the setting), ``'local'``
+    (``SET LOCAL`` or ``set_config(..., true)``), ``'reset'`` (back to the
+    default, the ``None`` the rest of the module models as no tenant) or
+    ``'session'`` (it outlives the statement where we cannot follow it,
+    hence ``UNKNOWN``).
     """
     guc = cachalot_settings.CACHALOT_TENANT_SETTING
     if guc is None:
@@ -514,14 +501,13 @@ def _parse_tenant_statement(sql, params=None):
         # The GUC name must appear literally, except when it arrives as a
         # set_config() parameter.  Scanning the parameters is worth it only
         # for that form, and `params` can be very long.
-        if not ('set_config' in lowered and params
-                and any(p == guc for p in _iter_params(params))):
+        values = params.values() if isinstance(params, dict) else params
+        if 'set_config' not in lowered or guc not in (values or ()):
             return NOT_A_SET, 'none'
 
     set_re, reset_re, set_config_re = _compile(guc)
 
-    # Collect every construct that touches the configured GUC, discarding the
-    # ones that only look like one because they sit in a literal or comment.
+    # Constructs sitting in a literal or comment only look like one.
     spans = _quoted_spans(sql)
     matches = []
 
@@ -546,7 +532,7 @@ def _parse_tenant_statement(sql, params=None):
         # pyformat placeholders: we cannot map positions to parameters.
         return UNKNOWN, 'session'
     if len(matches) > 1:
-        # We cannot tell which construct wins, so we trust none of them.
+        # We cannot tell which one wins, so we trust none of them.
         return UNKNOWN, 'session'
 
     match_type, match, name = matches[0]
@@ -568,12 +554,6 @@ def _parse_tenant_statement(sql, params=None):
                          match.start('value'), params), 'local')
     else:  # reset
         return None, 'reset'
-
-
-def _iter_params(params):
-    if isinstance(params, dict):
-        return params.values()
-    return params
 ```
 
 - [ ] **Step 4: Run the tests**
@@ -765,11 +745,9 @@ def observe_statement(connection, sql, params=None, failed=False):
         return
     tenant, scope = _parse_tenant_statement(sql, params)
     if scope == 'session':
-        # Session-scoped, or something we could not read.  Either way it can
-        # outlive this statement where we cannot follow it.  Sticky by
-        # design: only an explicit RESET tells us the setting is back to a
-        # state we know, and cachalot cannot see a reconnect, so the flag
-        # lives as long as the connection wrapper.
+        # Sticky by design: nothing tells us when a session-scoped value
+        # changes again, only a RESET tells us where it ended up, and a
+        # reconnect is invisible, so the flag lives as long as the wrapper.
         connection._cachalot_session_tenant_dirty = True
     elif scope == 'reset' and not failed:
         connection._cachalot_session_tenant_dirty = False
@@ -1166,12 +1144,8 @@ def _patch_cursor():
                 connection = cursor.db
                 if isinstance(sql, bytes):
                     sql = sql.decode('utf-8')
-                # `executemany` is never used to set a session variable, and
-                # its parameter list has no positional mapping we could use.
-                # ``sql`` is not always a str: psycopg3 accepts Composable
-                # objects, which have no ``.lower()``.  Skipping them keeps an
-                # AttributeError in this ``finally`` from masking the real
-                # database error.
+                # `executemany` never sets a session variable, and psycopg3
+                # Composable objects have no `.lower()` to parse.
                 if tenancy_enabled() and not is_many and isinstance(sql, str):
                     observe_statement(connection, sql, params, failed=failed)
                 if (cachalot_settings.CACHALOT_INVALIDATE_RAW

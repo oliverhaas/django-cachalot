@@ -117,10 +117,9 @@ class ParseTenantStatementTestCase(SimpleTestCase):
             UNKNOWN)
 
     def test_unresolvable_values_are_unknown(self):
-        # pyformat placeholders
         self.assertIs(
             self.parse('SET LOCAL app.tenant_id = %(t)s', {'t': '42'}), UNKNOWN)
-        # a computed value we will not evaluate
+        # A bare identifier may be a function call, so we do not evaluate it.
         self.assertIs(self.parse('SET LOCAL app.tenant_id = current_user'),
                       UNKNOWN)
         # the locality flag itself is a placeholder
@@ -136,11 +135,9 @@ class ParseTenantStatementTestCase(SimpleTestCase):
                           NOT_A_SET)
 
     def test_multiple_constructs_fail_closed(self):
-        # Two SET LOCAL statements for the GUC.
         self.assertIs(
             self.parse("SET LOCAL app.tenant_id = '1'; SET LOCAL app.tenant_id = '2'"),
             UNKNOWN)
-        # SET LOCAL followed by RESET of the GUC.
         self.assertIs(
             self.parse("SET LOCAL app.tenant_id = '42'; RESET app.tenant_id"),
             UNKNOWN)
@@ -187,8 +184,6 @@ class ParseTenantStatementTestCase(SimpleTestCase):
             '9')
 
     def test_unrelated_trailing_statement_ignored(self):
-        # One SET LOCAL for the GUC plus an unrelated statement.
-        # The guard does not fire; we return the value.
         self.assertEqual(self.parse("SET LOCAL app.tenant_id = '7'; SELECT 1"),
                          '7')
 
@@ -293,8 +288,7 @@ class ConnectionTenantTestCase(TenantStateMixin, TransactionTestCase):
 
     def test_outermost_push_clears_dirty_connection(self):
         with transaction.atomic():
-            # Simulate a missed pop by manually setting _cachalot_tenant
-            # with an empty stack, as if a previous transaction leaked
+            # A tenant with an empty stack is what a missed pop leaves.
             connection._cachalot_tenant = '99'
             connection._cachalot_tenant_stack = []
             push_tenant(connection)
@@ -302,13 +296,9 @@ class ConnectionTenantTestCase(TenantStateMixin, TransactionTestCase):
 
     def test_nested_push_does_not_clear(self):
         with transaction.atomic():
-            # Outermost push clears the live value
             push_tenant(connection)
-            # Set tenant inside the outer block
             observe_statement(connection, "SET LOCAL app.tenant_id = '7'")
-            # Guard: prove the setup worked
             self.assertEqual(get_tenant(connection), '7')
-            # Nested push must not clear the live value
             push_tenant(connection)
             self.assertEqual(get_tenant(connection), '7')
 
@@ -340,9 +330,8 @@ class TablePredicatesTestCase(SimpleTestCase):
 
     @override_settings(CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
     def test_are_all_shared_when_feature_disabled(self):
-        # With the feature off, are_all_shared should return True to behave
-        # like master (no tenant scoping), even if the table is not in the
-        # shared tables list.
+        # With the feature off nothing is tenant-scoped, so a table nobody
+        # listed as shared still counts as one.
         self.assertTrue(are_all_shared({'cachalot_test'}))
 
 
@@ -455,9 +444,8 @@ class DisabledFeatureTestCase(SimpleTestCase):
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
 class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
     def tearDown(self):
-        # A non-empty stack here means some push was never matched by a pop.
-        # Assert it before resetting, so an imbalance fails a test instead of
-        # passing silently.
+        # Assert before resetting, so an unmatched push fails a test rather
+        # than passing silently.
         stack = getattr(connection, '_cachalot_tenant_stack', None)
         self.assertFalse(stack, 'tenant stack leaked: %r' % (stack,))
         super().tearDown()
@@ -521,10 +509,8 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
                 'SQLite only: relies on SET LOCAL syntax being rejected '
                 'outright')
     def test_cursor_failure_lands_on_unknown(self):
-        # SQLite rejects `SET LOCAL` syntax outright, which drives the real
-        # patched cursor through its `except BaseException` path: the error
-        # must still propagate, and the tenant must land on UNKNOWN rather
-        # than being left alone or silently swallowed.
+        # SQLite rejects `SET LOCAL` outright, which is what drives the real
+        # cursor through its failure path.
         with transaction.atomic():
             with self.assertRaises(Exception):
                 with connection.cursor() as cursor:
@@ -533,16 +519,11 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
 
     @skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
     def test_cursor_failure_lands_on_unknown_postgresql(self):
-        # PostgreSQL accepts a custom GUC happily, so a bare `SET LOCAL`
-        # never fails there the way it does on SQLite. A trailing token
-        # after a valid-looking assignment still fails on the server with a
-        # syntax error, while the regex that extracts the tenant value pays
-        # it no mind, since it does not require the match to reach the end
-        # of the statement.
+        # PostgreSQL accepts any custom GUC, so a bare `SET LOCAL` never
+        # fails there. A trailing token makes the server reject it while the
+        # parser, which need not match to the end, still reads the value -
+        # asserted first, or the failure below would prove nothing.
         sql = "SET LOCAL app.tenant_id = '42' GARBAGE"
-        # Confirm the statement is recognised as touching the GUC and a
-        # value extracted from it. Without this, the statement would be
-        # ignored as NOT_A_SET and the failure below would prove nothing.
         self.assertEqual(parse_tenant_statement(sql), '42')
         with transaction.atomic():
             with self.assertRaises(Exception):
@@ -551,11 +532,9 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
             self.assertIs(get_tenant(connection), UNKNOWN)
 
     def test_stack_balances_when_feature_disabled_before_transaction_exits(self):
-        # Toggling CACHALOT_TENANT_SETTING off mid-transaction used to leak:
-        # `pop_tenant` self-guarded on `tenancy_enabled()`, so a block pushed
-        # while the feature was on would skip its pop if the feature was off
-        # by the time the block exited, leaving the stack permanently one
-        # deeper and letting a stale tenant survive into later transactions.
+        # `pop_tenant` used to self-guard on `tenancy_enabled()`, so a block
+        # pushed while the feature was on skipped its pop once it was off,
+        # leaving the stack one deeper for good.
         override = override_settings(CACHALOT_TENANT_SETTING=None)
         try:
             with transaction.atomic():
@@ -563,14 +542,10 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
                     connection, "SET LOCAL app.tenant_id = '42'")
                 self.assertEqual(get_tenant(connection), '42')
                 override.enable()
-                # The feature is off from here on, including when this
-                # `transaction.atomic()` block's `__exit__` runs below -
-                # exactly the case `pop_tenant` must still handle correctly.
                 self.assertIsNone(get_tenant(connection))
         finally:
-            # Not `addCleanup`: the assertions below need the feature back on.
-            # Without the `finally` a failed assertion above would skip this
-            # and leak the override into every later test in the process.
+            # Not `addCleanup`: the assertions below need the feature on
+            # again, and a failure above must not leak the override.
             override.disable()
         stack = getattr(connection, '_cachalot_tenant_stack', None)
         self.assertFalse(stack, 'tenant stack leaked: %r' % (stack,))
@@ -578,18 +553,13 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
             self.assertIsNone(get_tenant(connection))
 
     def test_interrupted_statement_lands_on_unknown(self):
-        # `except BaseException`, not `except Exception`: a statement killed
-        # by KeyboardInterrupt or SystemExit did not take effect either, so
-        # its tenant must not be trusted.  A plain OperationalError would
-        # pass against the old `except Exception` too, so this is the only
-        # test that pins the wider clause down.
+        # A statement killed by KeyboardInterrupt did not take effect
+        # either. An OperationalError would pass against a plain
+        # `except Exception` too, so only this pins the wider clause down.
         #
-        # The raw DB-API cursor cannot be mocked directly: psycopg2's cursor
-        # is a C extension type whose `execute` attribute is read-only, so
-        # `mock.patch.object` on it raises `AttributeError` instead of
-        # patching. Substituting the `cursor` attribute on the Django
-        # `CursorWrapper` instance itself works identically on every
-        # backend, since `CursorWrapper` is a plain Python object.
+        # psycopg2's cursor is a C type with a read-only `execute`, so it
+        # cannot be patched; swapping the attribute on Django's
+        # `CursorWrapper` works on every backend instead.
         class _RaisingCursor:
             def execute(self, *args, **kwargs):
                 raise KeyboardInterrupt
@@ -677,9 +647,8 @@ class TenantInvalidationTestCase(TenantStateMixin, TestUtilsMixin,
         self.assertGreater(self.last('a'), 0.0)
         self.assertGreater(self.last('b'), 0.0)
 
-        # No pseudo-tenant key was minted for the sentinel's repr. Built by
-        # hand, bypassing get_write_table_cache_keys, since that function now
-        # normalises UNKNOWN itself and can no longer produce this key.
+        # Built by hand: get_write_table_cache_keys normalises UNKNOWN and
+        # can no longer mint a key from the sentinel's repr.
         bogus_key = cachalot_settings.CACHALOT_TABLE_KEYGEN(
             DEFAULT_DB_ALIAS, PARTITIONED + TENANT_TABLE_SUFFIX + str(UNKNOWN))
         cache = cachalot_caches.get_cache(db_alias=DEFAULT_DB_ALIAS)
@@ -791,12 +760,9 @@ class PartitionedReadTestCase(TenantStateMixin, TestUtilsMixin,
             self.read('a')
 
     def test_unknown_tenant_is_never_cached(self):
-        # Assert on the cache directly, not just on the query count: a 1/1
-        # sequence also passes with caching switched off entirely, so it does
-        # not by itself prove the read stored anything. Snapshot the table
-        # cache keys this table could plausibly be stored under (unscoped or
-        # under tenant 'a') before and after, since the cache is shared with
-        # other tests and may already hold unrelated entries for this table.
+        # A 1/1 query count also passes with caching off entirely, so it
+        # proves nothing on its own. The cache is shared with other tests,
+        # hence the before/after snapshot rather than an emptiness check.
         cache = cachalot_caches.get_cache(db_alias=DEFAULT_DB_ALIAS)
         keys = (get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, None)
                + get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, 'a'))
@@ -831,8 +797,7 @@ class SharedTableTestCase(TenantStateMixin, TestUtilsMixin,
             with self.assertNumQueries(1):
                 list(User.objects.all())
         with as_tenant('b'):
-            # Distinct tenant, so this must not be served from tenant a's
-            # cache entry even though the table itself is not partitioned.
+            # Not partitioned, but still not tenant a's cache entry.
             with self.assertNumQueries(1):
                 list(User.objects.all())
         with as_tenant('a'):
@@ -848,21 +813,11 @@ class SharedTableTestCase(TenantStateMixin, TestUtilsMixin,
                        CACHALOT_PARTITIONED_TABLES=('cachalot_testparent',),
                        CACHALOT_TENANT_SHARED_TABLES=('cachalot_testparent',))
     def test_partitioned_and_shared_table_does_not_leak_across_tenants(self):
-        # A table listed as both partitioned and shared used to leak: the
-        # query key stayed unscoped (are_all_shared wrongly said True) while
-        # the invalidation keys stayed per-tenant, so tenant b's write only
-        # bumped its own tenant key, and b's re-stored rows -- freshly
-        # written under that same unscoped query key when b's own read
-        # missed -- were then served straight back to tenant a on a's next,
-        # otherwise valid, cache hit.
-        #
-        # With the fix, a's and b's reads land on distinct, tenant-folded
-        # query keys, so there is no shared slot left for b's rows to leak
-        # through. Tenant a's own key is never touched by b's write (that is
-        # the point of partitioning: one tenant's write must not invalidate
-        # another tenant's cache), so a's final read is legitimately a cache
-        # hit (0 queries) too -- what must not happen is that hit returning
-        # b's row, which is what the assertions below pin down.
+        # Listed as both, the query key used to stay unscoped while the
+        # invalidation keys stayed per-tenant, so b's rows landed in the slot
+        # a read from. Tenant a's key is never touched by b's write - that is
+        # the point of partitioning - so a's last read is legitimately a
+        # cache hit; what it returns is what these assertions pin down.
         with as_tenant('a'):
             with self.assertNumQueries(1):
                 rows_a_before = list(TestParent.objects.all())
@@ -992,9 +947,8 @@ class PostgresTenancyTestCase(TenantStateMixin, TestUtilsMixin,
         self.assertEqual(self.names('a'), ['row-a'])
 
     def test_session_scoped_tenant_is_never_served_from_cache(self):
-        # A tenant set on the session, not with SET LOCAL, is fully in force
-        # for RLS but invisible to cachalot's bookkeeping, so nothing read
-        # under it may be cached.
+        # A session-scoped tenant is fully in force for RLS but invisible
+        # to cachalot, so nothing read under it may be cached.
         self.create('a', 'row-a')
         self.create('b', 'row-b')
         with connection.cursor() as cursor:

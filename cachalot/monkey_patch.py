@@ -168,12 +168,8 @@ def _patch_cursor():
                 connection = cursor.db
                 if isinstance(sql, bytes):
                     sql = sql.decode('utf-8')
-                # `executemany` is never used to set a session variable, and
-                # its parameter list has no positional mapping we could use.
-                # `sql` is not always a str: psycopg3 accepts Composable
-                # objects, which have no `.lower()`. Skipping them keeps an
-                # AttributeError in this `finally` from masking the real
-                # database error.
+                # `executemany` never sets a session variable, and psycopg3
+                # Composable objects have no `.lower()` to parse.
                 if tenancy_enabled() and not is_many and isinstance(sql, str):
                     observe_statement(connection, sql, params, failed=failed)
                 if (cachalot_settings.CACHALOT_INVALIDATE_RAW
