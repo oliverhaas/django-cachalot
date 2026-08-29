@@ -200,9 +200,13 @@ def pop_tenant(connection):
     inside a released savepoint, we revert it to the tenant that was in force
     when the nested block was entered.
     """
-    if not tenancy_enabled():
-        return
     stack = getattr(connection, '_cachalot_tenant_stack', None)
+    if stack is None:
+        # Never pushed on this connection, so there is nothing to restore and
+        # nothing to write.  Deliberately not gated on ``tenancy_enabled()``:
+        # a block entered while the feature was on must still pop if the
+        # setting is toggled off before it exits.
+        return
     connection._cachalot_tenant = stack.pop() if stack else None
 
 

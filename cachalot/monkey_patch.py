@@ -145,7 +145,9 @@ def _patch_cursor():
             failed = False
             try:
                 return original(cursor, sql, *args, **kwargs)
-            except Exception:
+            except BaseException:
+                # BaseException, not Exception: an interrupted statement did
+                # not take effect either, and must not be trusted.
                 failed = True
                 raise
             finally:
@@ -154,7 +156,11 @@ def _patch_cursor():
                     sql = sql.decode('utf-8')
                 # `executemany` is never used to set a session variable, and
                 # its parameter list has no positional mapping we could use.
-                if tenancy_enabled() and not is_many:
+                # `sql` is not always a str: psycopg3 accepts Composable
+                # objects, which have no `.lower()`. Skipping them keeps an
+                # AttributeError in this `finally` from masking the real
+                # database error.
+                if tenancy_enabled() and not is_many and isinstance(sql, str):
                     observe_statement(connection, sql, params, failed=failed)
                 if (cachalot_settings.CACHALOT_INVALIDATE_RAW
                         and getattr(connection, 'raw', True)):
@@ -186,8 +192,10 @@ def _patch_atomic():
         @wraps(original)
         def inner(self):
             cachalot_caches.enter_atomic(self.using)
-            push_tenant(get_connection(self.using))
             original(self)
+            # After `original`: if entering the block raises, `__exit__`
+            # never runs, and a push made beforehand would never be popped.
+            push_tenant(get_connection(self.using))
 
         return inner
 

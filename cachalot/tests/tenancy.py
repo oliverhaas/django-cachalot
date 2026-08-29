@@ -324,6 +324,11 @@ class TableCacheKeysTestCase(SimpleTestCase):
 @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
 class TenantPlumbingTestCase(TransactionTestCase):
     def tearDown(self):
+        # A non-empty stack here means some push was never matched by a pop.
+        # Assert it before resetting, so an imbalance fails a test instead of
+        # passing silently.
+        stack = getattr(connection, '_cachalot_tenant_stack', None)
+        self.assertFalse(stack, 'tenant stack leaked: %r' % (stack,))
         connection._cachalot_tenant = None
         connection._cachalot_tenant_stack = []
 
@@ -380,3 +385,35 @@ class TenantPlumbingTestCase(TransactionTestCase):
                 cursor.execute(
                     'SELECT set_config(%s, %s, true)', ['app.tenant_id', '42'])
             self.assertEqual(get_tenant(connection), '42')
+
+    def test_cursor_failure_lands_on_unknown(self):
+        # SQLite rejects `SET LOCAL` syntax outright, which drives the real
+        # patched cursor through its `except BaseException` path: the error
+        # must still propagate, and the tenant must land on UNKNOWN rather
+        # than being left alone or silently swallowed.
+        with transaction.atomic():
+            with self.assertRaises(Exception):
+                with connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL app.tenant_id = '42'")
+            self.assertIs(get_tenant(connection), UNKNOWN)
+
+    def test_stack_balances_when_feature_disabled_before_transaction_exits(self):
+        # Toggling CACHALOT_TENANT_SETTING off mid-transaction used to leak:
+        # `pop_tenant` self-guarded on `tenancy_enabled()`, so a block pushed
+        # while the feature was on would skip its pop if the feature was off
+        # by the time the block exited, leaving the stack permanently one
+        # deeper and letting a stale tenant survive into later transactions.
+        override = override_settings(CACHALOT_TENANT_SETTING=None)
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            self.assertEqual(get_tenant(connection), '42')
+            override.enable()
+            # The feature is off from here on, including when this
+            # `transaction.atomic()` block's `__exit__` runs below - exactly
+            # the case `pop_tenant` must still handle correctly.
+            self.assertIsNone(get_tenant(connection))
+        override.disable()
+        stack = getattr(connection, '_cachalot_tenant_stack', None)
+        self.assertFalse(stack, 'tenant stack leaked: %r' % (stack,))
+        with transaction.atomic():
+            self.assertIsNone(get_tenant(connection))
