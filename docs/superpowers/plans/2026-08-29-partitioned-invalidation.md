@@ -638,9 +638,13 @@ def pop_tenant(connection):
     inside a released savepoint, we revert it to the tenant that was in force
     when the nested block was entered.
     """
-    if not tenancy_enabled():
-        return
     stack = getattr(connection, '_cachalot_tenant_stack', None)
+    if stack is None:
+        # Never pushed on this connection, so there is nothing to restore and
+        # nothing to write.  Deliberately not gated on ``tenancy_enabled()``:
+        # a block entered while the feature was on must still pop if the
+        # setting is toggled off before it exits.
+        return
     connection._cachalot_tenant = stack.pop() if stack else None
 
 
@@ -961,7 +965,9 @@ def _patch_cursor():
             failed = False
             try:
                 return original(cursor, sql, *args, **kwargs)
-            except Exception:
+            except BaseException:
+                # BaseException, not Exception: an interrupted statement did
+                # not take effect either, and must not be trusted.
                 failed = True
                 raise
             finally:
@@ -970,7 +976,11 @@ def _patch_cursor():
                     sql = sql.decode('utf-8')
                 # `executemany` is never used to set a session variable, and
                 # its parameter list has no positional mapping we could use.
-                if tenancy_enabled() and not is_many:
+                # ``sql`` is not always a str: psycopg3 accepts Composable
+                # objects, which have no ``.lower()``.  Skipping them keeps an
+                # AttributeError in this ``finally`` from masking the real
+                # database error.
+                if tenancy_enabled() and not is_many and isinstance(sql, str):
                     observe_statement(connection, sql, params, failed=failed)
                 if (cachalot_settings.CACHALOT_INVALIDATE_RAW
                         and getattr(connection, 'raw', True)):
@@ -1002,8 +1012,10 @@ In `_patch_atomic()`, change the two inner functions:
         @wraps(original)
         def inner(self):
             cachalot_caches.enter_atomic(self.using)
-            push_tenant(get_connection(self.using))
             original(self)
+            # After ``original``: if entering the block raises, ``__exit__``
+            # never runs, and a push made beforehand would never be popped.
+            push_tenant(get_connection(self.using))
 
         return inner
 
