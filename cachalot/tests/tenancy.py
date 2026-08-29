@@ -1,3 +1,5 @@
+from unittest import skipUnless
+
 from django.db import DEFAULT_DB_ALIAS, connection, transaction
 from django.test import TransactionTestCase, override_settings, SimpleTestCase
 
@@ -317,3 +319,64 @@ class TableCacheKeysTestCase(SimpleTestCase):
         base = 'a' * 40
         self.assertEqual(get_tenant_query_cache_key(base, 42),
                          get_tenant_query_cache_key(base, '42'))
+
+
+@override_settings(CACHALOT_TENANT_SETTING='app.tenant_id')
+class TenantPlumbingTestCase(TransactionTestCase):
+    def tearDown(self):
+        connection._cachalot_tenant = None
+        connection._cachalot_tenant_stack = []
+
+    def set_tenant(self, value):
+        """Issue the statement the app would issue, through a real cursor.
+
+        SQLite rejects it, PostgreSQL accepts it; either way the cursor patch
+        observes it, which is what this test is about.
+        """
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute('SET LOCAL app.tenant_id = %s', [value])
+        except Exception:
+            pass
+
+    def test_real_nested_atomic_restores_outer_tenant(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            with transaction.atomic():
+                observe_statement(connection, "SET LOCAL app.tenant_id = '43'")
+                self.assertEqual(get_tenant(connection), '43')
+            self.assertEqual(get_tenant(connection), '42')
+        self.assertIsNone(get_tenant(connection))
+
+    def test_rolled_back_atomic_restores_outer_tenant(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+            try:
+                with transaction.atomic():
+                    observe_statement(connection,
+                                      "SET LOCAL app.tenant_id = '43'")
+                    raise ValueError('rollback')
+            except ValueError:
+                pass
+            self.assertEqual(get_tenant(connection), '42')
+
+    def test_tenant_does_not_survive_the_transaction(self):
+        with transaction.atomic():
+            observe_statement(connection, "SET LOCAL app.tenant_id = '42'")
+        self.assertIsNone(get_tenant(connection))
+        with transaction.atomic():
+            self.assertIsNone(get_tenant(connection))
+
+    @skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+    def test_cursor_observes_a_real_set_local(self):
+        with transaction.atomic():
+            self.set_tenant('42')
+            self.assertEqual(get_tenant(connection), '42')
+
+    @skipUnless(connection.vendor == 'postgresql', 'PostgreSQL only')
+    def test_cursor_observes_a_real_set_config(self):
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    'SELECT set_config(%s, %s, true)', ['app.tenant_id', '42'])
+            self.assertEqual(get_tenant(connection), '42')

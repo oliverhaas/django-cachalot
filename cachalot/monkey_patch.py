@@ -15,6 +15,7 @@ from django.db.transaction import Atomic, get_connection
 from .api import invalidate, LOCAL_STORAGE
 from .cache import cachalot_caches
 from .settings import cachalot_settings, ITERABLES
+from .tenancy import observe_statement, pop_tenant, push_tenant, tenancy_enabled
 from .utils import (
     _get_table_cache_keys, _get_tables_from_sql,
     UncachableQuery, is_cachable, filter_cachable,
@@ -135,20 +136,32 @@ def _unpatch_orm():
 
 
 def _patch_cursor():
-    def _patch_cursor_execute(original):
+    def _patch_cursor_execute(original, is_many=False):
         @wraps(original)
         def inner(cursor, sql, *args, **kwargs):
+            params = None
+            if not is_many:
+                params = args[0] if args else kwargs.get('params')
+            failed = False
             try:
                 return original(cursor, sql, *args, **kwargs)
+            except Exception:
+                failed = True
+                raise
             finally:
                 connection = cursor.db
-                if getattr(connection, 'raw', True):
-                    if isinstance(sql, bytes):
-                        sql = sql.decode('utf-8')
-                    sql = sql.lower()
-                    if SQL_DATA_CHANGE_RE.search(sql):
+                if isinstance(sql, bytes):
+                    sql = sql.decode('utf-8')
+                # `executemany` is never used to set a session variable, and
+                # its parameter list has no positional mapping we could use.
+                if tenancy_enabled() and not is_many:
+                    observe_statement(connection, sql, params, failed=failed)
+                if (cachalot_settings.CACHALOT_INVALIDATE_RAW
+                        and getattr(connection, 'raw', True)):
+                    lowered = sql.lower()
+                    if SQL_DATA_CHANGE_RE.search(lowered):
                         tables = filter_cachable(
-                            _get_tables_from_sql(connection, sql))
+                            _get_tables_from_sql(connection, lowered))
                         if tables:
                             invalidate(
                                 *tables, db_alias=connection.alias,
@@ -156,9 +169,10 @@ def _patch_cursor():
 
         return inner
 
-    if cachalot_settings.CACHALOT_INVALIDATE_RAW:
+    if cachalot_settings.CACHALOT_INVALIDATE_RAW or tenancy_enabled():
         CursorWrapper.execute = _patch_cursor_execute(CursorWrapper.execute)
-        CursorWrapper.executemany = _patch_cursor_execute(CursorWrapper.executemany)
+        CursorWrapper.executemany = _patch_cursor_execute(
+            CursorWrapper.executemany, is_many=True)
 
 
 def _unpatch_cursor():
@@ -172,6 +186,7 @@ def _patch_atomic():
         @wraps(original)
         def inner(self):
             cachalot_caches.enter_atomic(self.using)
+            push_tenant(get_connection(self.using))
             original(self)
 
         return inner
@@ -179,12 +194,14 @@ def _patch_atomic():
     def patch_exit(original):
         @wraps(original)
         def inner(self, exc_type, exc_value, traceback):
-            needs_rollback = get_connection(self.using).needs_rollback
+            connection = get_connection(self.using)
+            needs_rollback = connection.needs_rollback
             try:
                 original(self, exc_type, exc_value, traceback)
             finally:
                 cachalot_caches.exit_atomic(
                     self.using, exc_type is None and not needs_rollback)
+                pop_tenant(connection)
 
         return inner
 

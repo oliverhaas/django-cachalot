@@ -15,7 +15,7 @@ from .debug_toolbar import DebugToolbarTestCase
 from .tenancy import (
     ConnectionTenantTestCase, ParseTenantStatementTestCase,
     TableCacheKeysTestCase, TablePredicatesTestCase, TenancyEnabledTestCase,
-    TenancySettingsTestCase,
+    TenancySettingsTestCase, TenantPlumbingTestCase,
 )
 
 
