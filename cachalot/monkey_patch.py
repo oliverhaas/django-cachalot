@@ -14,7 +14,9 @@ from django.db.transaction import Atomic, get_connection
 
 from .api import invalidate, LOCAL_STORAGE
 from .cache import cachalot_caches
+from .local_cache import get_local_ttl, local_get, local_set, _MISS
 from .settings import cachalot_settings, ITERABLES
+from .transaction import AtomicCache
 from .utils import (
     _get_table_cache_keys, _get_tables_from_sql,
     UncachableQuery, is_cachable, filter_cachable,
@@ -94,14 +96,30 @@ def _patch_compiler(original):
 
         try:
             cache_key = cachalot_settings.CACHALOT_QUERY_KEYGEN(compiler)
-            table_cache_keys = _get_table_cache_keys(compiler)
+            tables, table_cache_keys = _get_table_cache_keys(compiler)
         except (EmptyResultSet, UncachableQuery):
             return execute_query_func()
 
-        return _get_result_or_execute_query(
-            execute_query_func,
-            cachalot_caches.get_cache(db_alias=db_alias),
-            cache_key, table_cache_keys)
+        cache = cachalot_caches.get_cache(db_alias=db_alias)
+        in_transaction = isinstance(cache, AtomicCache)
+
+        # L1 local cache: only outside transactions
+        local_ttl = None
+        if not in_transaction:
+            local_ttl = get_local_ttl(tables)
+            if local_ttl is not None:
+                local_result = local_get(cache_key)
+                if local_result is not _MISS:
+                    return local_result
+
+        result = _get_result_or_execute_query(
+            execute_query_func, cache, cache_key, table_cache_keys)
+
+        # Populate L1 after successful L2 read (only outside transactions)
+        if local_ttl is not None:
+            local_set(cache_key, result, tables, local_ttl)
+
+        return result
 
     return inner
 
