@@ -141,6 +141,17 @@ Rationale: silently retaining a stale tenant value is a cross-tenant leak;
 declining to cache, and over-invalidating on write, are merely slow. The parser
 is permitted to be incomplete precisely because its failure mode is safe.
 
+A statement that touches the GUC but **raises** also lands on `UNKNOWN`. It
+never took effect in Postgres, so recording its value would be a lie; and since
+an error aborts the surrounding transaction anyway, refusing to cache for the
+remainder of it costs nothing.
+
+Tenant tracking is additionally confined to `connection.in_atomic_block`.
+Outside a transaction the tenant is always `None`, because a `SET LOCAL` issued
+in autocommit is discarded by Postgres immediately. This single guard also
+makes it impossible for a tenant value to survive on a pooled connection past
+the transaction that set it.
+
 Non-`LOCAL` `SET` is routed here rather than supported. Tracking
 connection-scoped state correctly would require patching
 `BaseDatabaseWrapper.close()` and reasoning about connection pooling, and the
