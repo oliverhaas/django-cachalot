@@ -83,12 +83,14 @@ class ParseTenantStatementTestCase(SimpleTestCase):
         self.assertEqual(self.parse("SET LOCAL app.tenant_id = '42'"), '42')
         self.assertEqual(self.parse("set local app.tenant_id to '42'"), '42')
         self.assertEqual(self.parse('SET LOCAL app.tenant_id = 42'), '42')
-        self.assertEqual(self.parse('SET LOCAL "app.tenant_id" = \'42\''), '42')
+        self.assertEqual(
+            self.parse('SET LOCAL "app.tenant_id" = \'42\''), '42')
 
     def test_set_local_placeholder(self):
         self.assertEqual(self.parse('SET LOCAL app.tenant_id = %s', ['42']),
                          '42')
-        self.assertEqual(self.parse('SET LOCAL app.tenant_id = %s', [42]), '42')
+        self.assertEqual(self.parse('SET LOCAL app.tenant_id = %s', [42]),
+                         '42')
 
     def test_set_config(self):
         self.assertEqual(
@@ -121,7 +123,8 @@ class ParseTenantStatementTestCase(SimpleTestCase):
 
     def test_unresolvable_values_are_unknown(self):
         self.assertIs(
-            self.parse('SET LOCAL app.tenant_id = %(t)s', {'t': '42'}), UNKNOWN)
+            self.parse('SET LOCAL app.tenant_id = %(t)s', {'t': '42'}),
+            UNKNOWN)
         self.assertIs(self.parse('SET LOCAL app.tenant_id = current_user'),
                       UNKNOWN)
         self.assertIs(
@@ -136,7 +139,8 @@ class ParseTenantStatementTestCase(SimpleTestCase):
 
     def test_multiple_constructs_fail_closed(self):
         self.assertIs(
-            self.parse("SET LOCAL app.tenant_id = '1'; SET LOCAL app.tenant_id = '2'"),
+            self.parse("SET LOCAL app.tenant_id = '1'; "
+                       "SET LOCAL app.tenant_id = '2'"),
             UNKNOWN)
         self.assertIs(
             self.parse("SET LOCAL app.tenant_id = '42'; RESET app.tenant_id"),
@@ -388,10 +392,12 @@ class TableCacheKeysTestCase(SimpleTestCase):
 
     def test_disabled_feature_produces_legacy_keys(self):
         for tenant in (None, '42'):
-            self.assertEqual(get_read_table_cache_keys(DB, PARTITIONED, tenant),
-                             [self.legacy_key(PARTITIONED)])
-            self.assertEqual(get_write_table_cache_keys(DB, PARTITIONED, tenant),
-                             [self.legacy_key(PARTITIONED)])
+            self.assertEqual(
+                get_read_table_cache_keys(DB, PARTITIONED, tenant),
+                [self.legacy_key(PARTITIONED)])
+            self.assertEqual(
+                get_write_table_cache_keys(DB, PARTITIONED, tenant),
+                [self.legacy_key(PARTITIONED)])
 
     @override_settings(CACHALOT_TENANT_SETTING='app.tenant_id',
                        CACHALOT_PARTITIONED_TABLES=(PARTITIONED,))
@@ -568,7 +574,7 @@ class TenantPlumbingTestCase(TenantStateMixin, TransactionTestCase):
                     cursor.execute(sql)
             self.assertIs(get_tenant(connection), UNKNOWN)
 
-    def test_stack_balances_when_feature_disabled_before_transaction_exits(self):
+    def test_stack_balances_when_feature_disabled_mid_transaction(self):
         # `pop_tenant` used to self-guard on `tenancy_enabled()`, so a block
         # pushed while the feature was on skipped its pop once it was off,
         # leaving the stack one deeper for good.
@@ -796,8 +802,9 @@ class PartitionedReadTestCase(TenantStateMixin, TestUtilsMixin,
         # proves nothing on its own. The cache is shared with other tests,
         # hence the before/after snapshot rather than an emptiness check.
         cache = cachalot_caches.get_cache(db_alias=DEFAULT_DB_ALIAS)
-        keys = (get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, None)
-               + get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, 'a'))
+        keys = (
+            get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, None)
+            + get_write_table_cache_keys(DEFAULT_DB_ALIAS, PARTITIONED, 'a'))
         before = cache.get_many(keys)
         with transaction.atomic():
             observe_statement(connection, "SET app.tenant_id = 'a'")

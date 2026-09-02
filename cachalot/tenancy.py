@@ -139,13 +139,13 @@ def _quoted_spans(sql):
 
 
 def _is_quoted(spans, starts, pos):
-    """Whether ``pos`` falls in one of the non-overlapping, ordered ``spans``."""
+    """Whether ``pos`` lies inside one of the ordered ``spans``."""
     index = bisect_right(starts, pos) - 1
     return index >= 0 and pos < spans[index][1]
 
 
 def _resolve(token, sql, pos, params):
-    """Turn a matched SQL token into a tenant value, ``None`` or ``UNKNOWN``."""
+    """Turn a matched token into a tenant value, ``None`` or ``UNKNOWN``."""
     if token == '%s':
         if params is None:
             return UNKNOWN
