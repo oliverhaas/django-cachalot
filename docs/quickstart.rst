@@ -260,6 +260,42 @@ Settings
             pymemcache is 1.4× slower then 6.5× faster
             redis      is 1.5× slower then 6.2× faster
 
+``CACHALOT_TENANT_SETTING``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Default: ``None``
+:Description:
+  Name of the PostgreSQL session variable that carries the current tenant,
+  such as ``'app.tenant_id'``. Setting it enables per-tenant cache
+  partitioning for Row-Level Security deployments; see :ref:`Tenancy`.
+
+``CACHALOT_PARTITIONED_TABLES``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Default: ``frozenset()``
+:Description:
+  Sequence of SQL table names whose rows are constrained by a Row-Level
+  Security policy. Writes to these tables under a tenant invalidate only
+  that tenant's cached queries. See :ref:`Tenancy`.
+
+``CACHALOT_PARTITIONED_APPS``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Default: ``frozenset()``
+:Description:
+  Sequence of Django apps whose associated models will be appended to
+  ``CACHALOT_PARTITIONED_TABLES`` on initial Django setup.
+
+``CACHALOT_TENANT_SHARED_TABLES``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Default: ``frozenset()``
+:Description:
+  Sequence of SQL table names that hold the same rows for every tenant.
+  Queries on them keep one shared cache key instead of one per tenant.
+  A table listed here and in ``CACHALOT_PARTITIONED_TABLES`` is treated as
+  partitioned. See :ref:`Tenancy`.
+
 
 
 .. _Command:
