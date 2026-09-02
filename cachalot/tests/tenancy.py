@@ -179,8 +179,6 @@ class ParseTenantStatementTestCase(SimpleTestCase):
             '9')
 
     def test_placeholder_inside_a_literal_still_counts(self):
-        # A placeholder counts even inside a literal, so the tenant is the
-        # second parameter here.
         self.assertEqual(
             self.parse("INSERT INTO log (msg) VALUES ('a %s b'); "
                        'SET LOCAL app.tenant_id = %s', ['msg', '9']),
