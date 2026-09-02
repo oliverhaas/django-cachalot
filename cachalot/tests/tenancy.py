@@ -882,6 +882,11 @@ class PostgresTenancyTestCase(TenantStateMixin, TestUtilsMixin,
     """
 
     def setUp(self):
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT rolsuper OR rolbypassrls FROM pg_roles '
+                           'WHERE rolname = current_user')
+            if cursor.fetchone()[0]:
+                self.skipTest('the database role bypasses Row-Level Security')
         super().setUp()
         with connection.cursor() as cursor:
             cursor.execute(

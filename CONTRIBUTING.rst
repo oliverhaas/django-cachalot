@@ -18,6 +18,7 @@ Make sure you have the following services:
 For setup:
 
 #. Install: ``pip install -r requirements/hacking.txt``
-#. For PostgreSQL: ``CREATE ROLE cachalot LOGIN SUPERUSER;``
+#. For PostgreSQL: ``CREATE ROLE cachalot LOGIN CREATEDB;`` (not ``SUPERUSER``:
+   a superuser bypasses Row-Level Security, so the tenancy tests skip)
 #. Run: ``tox --current-env`` to run the test suite on your current Python version.
 #. You can also run specific databases and Django versions: ``tox -e py38-django3.1-postgresql-redis``
