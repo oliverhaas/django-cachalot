@@ -986,8 +986,6 @@ class PostgresTenancyTestCase(TenantStateMixin, TestUtilsMixin,
         self.assertEqual(self.names('a'), ['row-a'])
 
     def test_session_scoped_tenant_is_never_served_from_cache(self):
-        # A session-scoped tenant is fully in force for RLS but invisible
-        # to cachalot, so nothing read under it may be cached.
         self.create('a', 'row-a')
         self.create('b', 'row-b')
         with connection.cursor() as cursor:
