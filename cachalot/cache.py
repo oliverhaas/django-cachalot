@@ -49,8 +49,9 @@ class CacheHandler(local):
                 to_be_invalidated.update(atomic_cache.to_be_invalidated)
             # This happens when committing the outermost atomic block.
             if not self.atomic_caches[db_alias]:
-                for table in to_be_invalidated:
-                    post_invalidation.send(table, db_alias=db_alias)
+                for table, tenant in to_be_invalidated:
+                    post_invalidation.send(table, db_alias=db_alias,
+                                           tenant=tenant)
 
 
 cachalot_caches = CacheHandler()

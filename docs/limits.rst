@@ -197,3 +197,11 @@ of an installed application:
                 invalidate(sender, db_alias=db_alias, cache_alias=cache_alias)
             finally:
                 SIGNAL_INFO.was_called = False
+
+Row-Level Security
+..................
+
+If you isolate tenants with PostgreSQL Row-Level Security, the same SQL returns
+different rows for different tenants, and django-cachalot cannot see the
+difference. Configure :ref:`multi-tenancy <Tenancy>` or one tenant will be
+served another's cached rows.

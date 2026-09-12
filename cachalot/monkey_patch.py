@@ -15,8 +15,12 @@ from django.db.transaction import Atomic, get_connection
 from .api import invalidate, LOCAL_STORAGE
 from .cache import cachalot_caches
 from .settings import cachalot_settings, ITERABLES
+from .tenancy import (
+    UNKNOWN, are_all_shared, get_tenant, observe_statement, pop_tenant,
+    push_tenant, tenancy_enabled,
+)
 from .utils import (
-    _get_table_cache_keys, _get_tables_from_sql,
+    _get_table_cache_keys, _get_tables_from_sql, get_tenant_query_cache_key,
     UncachableQuery, is_cachable, filter_cachable,
 )
 
@@ -92,11 +96,20 @@ def _patch_compiler(original):
                 or isinstance(compiler, WRITE_COMPILERS):
             return execute_query_func()
 
+        tenant = get_tenant(compiler.connection)
+        if tenant is UNKNOWN:
+            # We cannot tell which tenant this query belongs to, so we must
+            # not serve it from cache nor put it in one.
+            return execute_query_func()
+
         try:
             cache_key = cachalot_settings.CACHALOT_QUERY_KEYGEN(compiler)
-            table_cache_keys = _get_table_cache_keys(compiler)
+            tables, table_cache_keys = _get_table_cache_keys(compiler, tenant)
         except (EmptyResultSet, UncachableQuery):
             return execute_query_func()
+
+        if tenant is not None and not are_all_shared(tables):
+            cache_key = get_tenant_query_cache_key(cache_key, tenant)
 
         return _get_result_or_execute_query(
             execute_query_func,
@@ -113,8 +126,10 @@ def _patch_write_compiler(original):
         db_alias = write_compiler.using
         table = write_compiler.query.get_meta().db_table
         if is_cachable(table):
+            tenant = get_tenant(write_compiler.connection)
             invalidate(table, db_alias=db_alias,
-                       cache_alias=cachalot_settings.CACHALOT_CACHE)
+                       cache_alias=cachalot_settings.CACHALOT_CACHE,
+                       tenant=None if tenant is UNKNOWN else tenant)
         return original(write_compiler, *args, **kwargs)
 
     return inner
@@ -135,30 +150,47 @@ def _unpatch_orm():
 
 
 def _patch_cursor():
-    def _patch_cursor_execute(original):
+    def _patch_cursor_execute(original, is_many=False):
         @wraps(original)
         def inner(cursor, sql, *args, **kwargs):
+            params = None
+            if not is_many:
+                params = args[0] if args else kwargs.get('params')
+            failed = False
             try:
                 return original(cursor, sql, *args, **kwargs)
+            except BaseException:
+                # BaseException, not Exception: an interrupted statement did
+                # not take effect either, and must not be trusted.
+                failed = True
+                raise
             finally:
                 connection = cursor.db
-                if getattr(connection, 'raw', True):
-                    if isinstance(sql, bytes):
-                        sql = sql.decode('utf-8')
-                    sql = sql.lower()
-                    if SQL_DATA_CHANGE_RE.search(sql):
+                if isinstance(sql, bytes):
+                    sql = sql.decode('utf-8')
+                # `executemany` never sets a session variable, and psycopg3
+                # Composable objects have no `.lower()` to parse.
+                if tenancy_enabled() and not is_many and isinstance(sql, str):
+                    observe_statement(connection, sql, params, failed=failed)
+                if (cachalot_settings.CACHALOT_INVALIDATE_RAW
+                        and getattr(connection, 'raw', True)):
+                    lowered = sql.lower()
+                    if SQL_DATA_CHANGE_RE.search(lowered):
                         tables = filter_cachable(
-                            _get_tables_from_sql(connection, sql))
+                            _get_tables_from_sql(connection, lowered))
                         if tables:
+                            tenant = get_tenant(connection)
                             invalidate(
                                 *tables, db_alias=connection.alias,
-                                cache_alias=cachalot_settings.CACHALOT_CACHE)
+                                cache_alias=cachalot_settings.CACHALOT_CACHE,
+                                tenant=None if tenant is UNKNOWN else tenant)
 
         return inner
 
-    if cachalot_settings.CACHALOT_INVALIDATE_RAW:
+    if cachalot_settings.CACHALOT_INVALIDATE_RAW or tenancy_enabled():
         CursorWrapper.execute = _patch_cursor_execute(CursorWrapper.execute)
-        CursorWrapper.executemany = _patch_cursor_execute(CursorWrapper.executemany)
+        CursorWrapper.executemany = _patch_cursor_execute(
+            CursorWrapper.executemany, is_many=True)
 
 
 def _unpatch_cursor():
@@ -173,18 +205,23 @@ def _patch_atomic():
         def inner(self):
             cachalot_caches.enter_atomic(self.using)
             original(self)
+            # After `original`: if entering the block raises, `__exit__`
+            # never runs, and a push made beforehand would never be popped.
+            push_tenant(get_connection(self.using))
 
         return inner
 
     def patch_exit(original):
         @wraps(original)
         def inner(self, exc_type, exc_value, traceback):
-            needs_rollback = get_connection(self.using).needs_rollback
+            connection = get_connection(self.using)
+            needs_rollback = connection.needs_rollback
             try:
                 original(self, exc_type, exc_value, traceback)
             finally:
-                cachalot_caches.exit_atomic(
-                    self.using, exc_type is None and not needs_rollback)
+                committed = exc_type is None and not needs_rollback
+                cachalot_caches.exit_atomic(self.using, committed)
+                pop_tenant(connection, committed)
 
         return inner
 

@@ -52,6 +52,7 @@ Below the tree is an in-depth opinion from the new maintainer:
    introduction
    quickstart
    limits
+   tenancy
    api
    benchmark
    todo

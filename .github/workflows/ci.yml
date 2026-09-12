@@ -61,9 +61,9 @@ jobs:
         ports:
           - 5432:5432
         env:
-          POSTGRES_USER: cachalot
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: cachalot
+          # The bootstrap user is a superuser and so bypasses Row-Level
+          # Security; the non-superuser role the tests use is created below.
+          POSTGRES_PASSWORD: postgres
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -83,6 +83,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v6
+    - name: Create a non-superuser PostgreSQL role
+      run: |
+        docker exec ${{ job.services.postgres.id }} psql -U postgres \
+          -c "CREATE ROLE cachalot LOGIN CREATEDB PASSWORD 'password';" \
+          -c "CREATE DATABASE cachalot OWNER cachalot;"
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
       with:

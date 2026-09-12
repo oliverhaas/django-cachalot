@@ -62,6 +62,10 @@ class Settings(object):
     CACHALOT_QUERY_KEYGEN = 'cachalot.utils.get_query_cache_key'
     CACHALOT_TABLE_KEYGEN = 'cachalot.utils.get_table_cache_key'
     CACHALOT_FINAL_SQL_CHECK = False
+    CACHALOT_TENANT_SETTING = None
+    CACHALOT_PARTITIONED_TABLES = ()
+    CACHALOT_PARTITIONED_APPS = ()
+    CACHALOT_TENANT_SHARED_TABLES = ()
 
     @classmethod
     def add_converter(cls, setting):
@@ -151,6 +155,16 @@ def convert(value):
 @Settings.add_converter('CACHALOT_TABLE_KEYGEN')
 def convert(value):
     return import_string(value)
+
+
+@Settings.add_converter('CACHALOT_PARTITIONED_TABLES')
+def convert(value):
+    return convert_tables(value, 'CACHALOT_PARTITIONED_APPS')
+
+
+@Settings.add_converter('CACHALOT_TENANT_SHARED_TABLES')
+def convert(value):
+    return frozenset(value)
 
 
 cachalot_settings = Settings()
