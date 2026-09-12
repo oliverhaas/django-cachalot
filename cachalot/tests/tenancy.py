@@ -1051,7 +1051,6 @@ class PlaceholderOffsetTestCase(SimpleTestCase):
     def mogrify(self, sql, params):
         with connection.cursor() as cursor:
             sent = cursor.cursor.mogrify(sql, params)
-        # psycopg2 returns bytes, psycopg3 str.
         return sent.decode() if isinstance(sent, bytes) else sent
 
     def driver_tenant(self, sql, params):
