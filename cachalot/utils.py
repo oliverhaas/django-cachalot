@@ -132,12 +132,7 @@ def get_table_cache_key(db_alias, table):
 
 
 def _get_tables_from_sql(connection, lowercased_sql, enable_quote: bool = False):
-    """
-    Returns names of involved tables after analyzing the final SQL query.
-
-    Table names are matched as whole identifiers, so ``cachalot_test``
-    is not found in ``cachalot_testparent``.
-    """
+    """Returns names of involved tables after analyzing the final SQL query."""
     tables = set()
     for table in (connection.introspection.django_table_names()
                   + cachalot_settings.CACHALOT_ADDITIONAL_TABLES):
