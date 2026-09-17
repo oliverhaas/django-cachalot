@@ -748,6 +748,45 @@ class WriteTestCase(TestUtilsMixin, FilteredTransactionTestCase):
             self.assertListEqual(data4, [t1, t2])
             self.assertListEqual([o.username_length for o in data4], [4, 5])
 
+    def test_invalidate_prefetch_related_similar_table_names(self):
+        """
+        Writes to ``cachalot_test`` must not invalidate the many-to-many
+        prefetch query on ``cachalot_testchild_permissions``: that table name
+        is only a substring of the through table name. Writes to the tables
+        the prefetch query really reads must still invalidate it.
+        """
+        child = TestChild.objects.create(name='child')
+        permissions = list(Permission.objects.all()[:2])
+        child.permissions.add(permissions[0])
+
+        def _query():
+            return [list(c.permissions.all())
+                    for c in TestChild.objects.prefetch_related('permissions')]
+
+        with self.assertNumQueries(2):
+            self.assertListEqual(_query(), [[permissions[0]]])
+        with self.assertNumQueries(0):
+            self.assertListEqual(_query(), [[permissions[0]]])
+
+        Test.objects.create(name='test')
+        with self.assertNumQueries(0):
+            self.assertListEqual(_query(), [[permissions[0]]])
+
+        child.permissions.add(permissions[1])
+        with self.assertNumQueries(1):
+            self.assertListEqual(_query(), [permissions])
+
+        permissions[1].save()
+        with self.assertNumQueries(1):
+            self.assertListEqual(_query(), [permissions])
+
+        child2 = TestChild.objects.create(name='child2')
+        with self.assertNumQueries(2):
+            self.assertListEqual(_query(), [permissions, []])
+        child2.delete()
+        with self.assertNumQueries(2):
+            self.assertListEqual(_query(), [permissions])
+
     def test_invalidate_having(self):
         def _query():
             return User.objects.annotate(n=Count('user_permissions')).filter(n__gte=1)

@@ -1,5 +1,7 @@
 import datetime
+import re
 from decimal import Decimal
+from functools import lru_cache
 from hashlib import sha1
 from time import time
 from typing import TYPE_CHECKING
@@ -131,9 +133,32 @@ def get_table_cache_key(db_alias, table):
 
 def _get_tables_from_sql(connection, lowercased_sql, enable_quote: bool = False):
     """Returns names of involved tables after analyzing the final SQL query."""
-    return {table for table in (connection.introspection.django_table_names()
-            + cachalot_settings.CACHALOT_ADDITIONAL_TABLES)
-            if _quote_table_name(table, connection, enable_quote) in lowercased_sql}
+    tables = set()
+    for table in (connection.introspection.django_table_names()
+                  + cachalot_settings.CACHALOT_ADDITIONAL_TABLES):
+        name = _quote_table_name(table, connection, enable_quote)
+        if (name in lowercased_sql
+                and _table_name_re(name).search(lowercased_sql)):
+            tables.add(table)
+    return tables
+
+
+@lru_cache(maxsize=None)
+def _table_name_re(table_name):
+    """
+    Compiles a pattern matching ``table_name`` as a whole identifier.
+
+    A boundary is only required where the name starts or ends with an
+    identifier character: ``cachalot_test`` must not match
+    ``cachalot_testparent``, while ``"cachalot_test"`` is already delimited
+    by its quotes and matches even in ``from"cachalot_test"``.
+    """
+    pattern = re.escape(table_name)
+    if re.match(r'\w', table_name[:1]):
+        pattern = r'(?<!\w)' + pattern
+    if re.match(r'\w', table_name[-1:]):
+        pattern += r'(?!\w)'
+    return re.compile(pattern)
 
 
 def _quote_table_name(table_name, connection, enable_quote: bool):
@@ -223,6 +248,20 @@ def _flatten(expression: 'BaseExpression'):
                 yield expr
 
 
+def _get_sql(db_alias, query, compiler=False):
+    """
+    Returns the lowercased SQL of ``query``.
+
+    Reuses the SQL stored on ``compiler`` by ``get_query_cache_key`` to avoid
+    compiling the query twice. A custom ``CACHALOT_QUERY_KEYGEN`` does not
+    store it, in which case the query is compiled here.
+    """
+    sql = getattr(compiler, '__cachalot_generated_sql', None)
+    if sql is None:
+        sql = query.get_compiler(db_alias).as_sql()[0].lower()
+    return sql
+
+
 def _get_tables(db_alias, query, compiler=False):
     from django.db import connections
 
@@ -232,9 +271,6 @@ def _get_tables(db_alias, query, compiler=False):
         raise UncachableQuery
 
     try:
-        if query.extra_select:
-            raise IsRawQuery
-
         # Gets all tables already found by the ORM.
         tables = set(query.table_map)
         if query.get_meta():
@@ -273,19 +309,19 @@ def _get_tables(db_alias, query, compiler=False):
         if query.combined_queries:
             for combined_query in query.combined_queries:
                 tables.update(_get_tables(db_alias, combined_query))
+        # Gets tables in the raw SQL of `.extra(select=...)`.
+        if query.extra_select:
+            tables.update(_get_tables_from_sql(
+                connections[db_alias], _get_sql(db_alias, query, compiler)))
     except IsRawQuery:
-        sql = query.get_compiler(db_alias).as_sql()[0].lower()
+        sql = _get_sql(db_alias, query, compiler)
         tables = _get_tables_from_sql(connections[db_alias], sql)
     else:
         # Additional check of the final SQL.
         # Potentially overlooked tables are added here. Tables may be overlooked by the regular checks
         # as not all expressions are handled yet. This final check acts as safety net.
         if cachalot_settings.CACHALOT_FINAL_SQL_CHECK:
-            if compiler:
-                # Access generated SQL stored when caching the query!
-                sql = compiler.__cachalot_generated_sql
-            else:
-                sql = query.get_compiler(db_alias).as_sql()[0].lower()
+            sql = _get_sql(db_alias, query, compiler)
             final_check_tables = _get_tables_from_sql(connections[db_alias], sql, enable_quote=True)
             tables.update(final_check_tables)
 
