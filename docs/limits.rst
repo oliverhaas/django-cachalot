@@ -100,11 +100,6 @@ By default, django-cachalot tries to invalidate its cache after a raw query.
 It detects if the raw query contains ``UPDATE``, ``INSERT``, ``DELETE``,
 ``ALTER``, ``CREATE`` or ``DROP`` and then invalidates the tables contained
 in that query by comparing with models registered by Django.
-Table names are matched as whole identifiers: a raw query on
-``cachalot_test_backup`` does not invalidate ``cachalot_test``, and a cached
-query reading ``cachalot_test_backup`` in raw SQL is not invalidated by
-writes to ``cachalot_test``. If such a table is a partition or a view of a
-model’s table, use :ref:`the API <Api>` to invalidate manually.
 
 This is quite robust, so if a query is not invalidated automatically
 by this system, please :ref:`send a bug report <Reporting>`.
