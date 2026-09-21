@@ -926,6 +926,19 @@ class ReadTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         self.assert_query_cached(qs)
 
     @all_final_sql_checks
+    def test_extra_select_masked_by_values(self):
+        """
+        ``.values()`` hides the extra select from ``query.extra_select``,
+        but ordering by its alias still puts the raw SQL in the query,
+        so the tables it references must be detected.
+        """
+        qs = Test.objects.extra(
+            select={'parents': 'SELECT COUNT(*) FROM cachalot_testparent'}
+        ).values('id').order_by('parents', 'name')
+        self.assert_tables(qs, Test, TestParent)
+        self.assert_query_cached(qs, [{'id': self.t1.pk}, {'id': self.t2.pk}])
+
+    @all_final_sql_checks
     def test_extra_where_similar_table_names(self):
         """
         Raw SQL must only match whole table names: ``cachalot_test`` must not
@@ -1151,6 +1164,17 @@ class ReadTestCase(TestUtilsMixin, FilteredTransactionTestCase):
     def test_now_annotate(self):
         """Check that queries with a Now() annotation are not cached #193"""
         qs = Test.objects.annotate(now=Now())
+        self.assert_query_cached(qs, after=1)
+
+    @all_final_sql_checks
+    def test_now_extra_select(self):
+        """
+        ``.extra(select=...)`` queries are analysed like any other query,
+        so a ``Now()`` parameter still makes them uncachable.
+        """
+        qs = Test.objects.extra(select={'one': '1'}).filter(datetime__lte=Now())
+        with self.assertRaises(UncachableQuery):
+            self.assert_tables(qs, Test)
         self.assert_query_cached(qs, after=1)
 
 

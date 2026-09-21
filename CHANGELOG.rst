@@ -1,5 +1,18 @@
 What’s new in django-cachalot?
 ==============================
+2.9.2
+-----
+- Fix #295: many-to-many ``prefetch_related`` queries, and other
+  ``.extra(select=...)`` queries, are no longer invalidated by writes to
+  tables whose names merely contain the names of the tables they use (#297)
+- Table names are matched as whole identifiers in raw SQL, so a raw query
+  on a table such as ``cachalot_test_backup`` no longer invalidates
+  ``cachalot_test`` (#297)
+- Fix ``.extra(select=...)`` queries being cached stale when ``.values()``
+  hides the extra select or when a ``Now()`` parameter is used, and
+  ``CACHALOT_FINAL_SQL_CHECK`` raising ``AttributeError`` with a custom
+  ``CACHALOT_QUERY_KEYGEN`` (#297)
+
 2.9.1
 -----
 - Add support for Django 6.1

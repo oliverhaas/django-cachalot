@@ -1,3 +1,4 @@
+from hashlib import sha1
 from time import sleep
 from unittest import skipIf
 from unittest.mock import MagicMock, patch
@@ -15,6 +16,14 @@ from ..settings import SUPPORTED_DATABASE_ENGINES, SUPPORTED_ONLY
 from ..utils import _get_tables
 from .models import Test, TestChild, TestParent, UnmanagedModel
 from .test_utils import TestUtilsMixin
+
+
+def query_keygen_without_sql(compiler):
+    """
+    A query key generator that, unlike the default one, does not store
+    the generated SQL on the compiler.
+    """
+    return sha1(str(compiler.as_sql()).encode('utf-8')).hexdigest()
 
 
 class SettingsTestCase(TestUtilsMixin, TransactionTestCase):
@@ -336,6 +345,20 @@ class SettingsTestCase(TestUtilsMixin, TransactionTestCase):
         tables = _get_tables(qs.db, qs.query, compiler_mock)
         self.assertTrue(tables)
         return tables
+
+    @override_settings(
+        CACHALOT_QUERY_KEYGEN='cachalot.tests.settings.query_keygen_without_sql')
+    def test_query_keygen_without_generated_sql(self):
+        """
+        When the key generator does not store the generated SQL on the
+        compiler, the SQL must be generated again wherever it is needed.
+        """
+        qs = Test.objects.extra(select={'one': '1'})
+        self.assert_tables(qs, Test)
+        self.assert_query_cached(qs)
+
+        with self.settings(CACHALOT_FINAL_SQL_CHECK=True):
+            self.assert_query_cached(Test.objects.all())
 
     @override_settings(CACHALOT_FINAL_SQL_CHECK=True)
     @patch('cachalot.utils._get_tables_from_sql')
