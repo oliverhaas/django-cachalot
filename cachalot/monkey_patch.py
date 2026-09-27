@@ -62,6 +62,9 @@ def _get_result_or_execute_query(execute_query_func, cache,
                 # we simply run the query and cache again the results.
                 pass
 
+    # Taken before the query runs, so that a write committed
+    # while the query runs invalidates this result.
+    now = time()
     result = execute_query_func()
 
     if result.__class__ == types.GeneratorType and not cachalot_settings.CACHALOT_CACHE_ITERATORS:
@@ -70,7 +73,6 @@ def _get_result_or_execute_query(execute_query_func, cache,
     if result.__class__ not in ITERABLES and isinstance(result, Iterable):
         result = list(result)
 
-    now = time()
     to_be_set = {k: now for k in new_table_cache_keys}
     to_be_set[cache_key] = (now, result)
     cache.set_many(to_be_set, cachalot_settings.CACHALOT_TIMEOUT)
@@ -112,10 +114,12 @@ def _patch_write_compiler(original):
     def inner(write_compiler, *args, **kwargs):
         db_alias = write_compiler.using
         table = write_compiler.query.get_meta().db_table
-        if is_cachable(table):
-            invalidate(table, db_alias=db_alias,
-                       cache_alias=cachalot_settings.CACHALOT_CACHE)
-        return original(write_compiler, *args, **kwargs)
+        try:
+            return original(write_compiler, *args, **kwargs)
+        finally:
+            if is_cachable(table):
+                invalidate(table, db_alias=db_alias,
+                           cache_alias=cachalot_settings.CACHALOT_CACHE)
 
     return inner
 
