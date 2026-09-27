@@ -18,6 +18,12 @@ class TestThread(Thread):
         connection.close()
 
 
+class CreateThread(TestThread):
+    def run(self):
+        self.t = Test.objects.create(name='test')
+        connection.close()
+
+
 @skipUnlessDBFeature('test_db_allows_multiple_connections')
 class ThreadSafetyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
     def test_concurrent_caching(self):
@@ -118,3 +124,29 @@ class ThreadSafetyTestCase(TestUtilsMixin, FilteredTransactionTestCase):
         with self.assertNumQueries(0):
             data = Test.objects.first()
         self.assertEqual(data, t)
+
+    def test_concurrent_caching_during_autocommit_write(self):
+        results = []
+
+        def read_before_write(execute, sql, params, many, context):
+            results.append(TestThread().start_and_join())
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(read_before_write):
+            t = Test.objects.create(name='test')
+
+        self.assertListEqual(results, [None])
+        self.assertEqual(Test.objects.first(), t)
+
+    def test_concurrent_write_between_query_and_caching(self):
+        created = []
+
+        def write_after_read(execute, sql, params, many, context):
+            result = execute(sql, params, many, context)
+            created.append(CreateThread().start_and_join())
+            return result
+
+        with connection.execute_wrapper(write_after_read):
+            self.assertIsNone(Test.objects.first())
+
+        self.assertEqual(Test.objects.first(), created[0])
